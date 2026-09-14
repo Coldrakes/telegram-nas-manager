@@ -168,39 +168,3 @@ TG_MAX_PARALLEL=3
 significa que como máximo habrá tres archivos descargándose simultáneamente.
 
 El bot muestra las descargas activas en un único mensaje de Telegram y lo actualiza periódicamente.
-
-## GitHub
-
-No subas nunca:
-
-- `.env`
-- `*.session`
-- `data/`
-- `temp/`
-
-El repositorio incluye `.gitignore` y `.env.example` para evitarlo.
-
-## Estructura
-
-```text
-telegram-nas-manager/
-├── bot.py
-├── config.py
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-├── .dockerignore
-├── .gitignore
-├── .env.example
-├── README.md
-├── handlers/
-│   ├── __init__.py
-│   ├── commands.py
-│   └── files.py
-└── services/
-    ├── __init__.py
-    ├── storage.py
-    ├── telethon_downloader.py
-    ├── series_organizer.py
-    └── three_d_organizer.py
-```
