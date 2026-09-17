@@ -9,10 +9,10 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
-from config import TG_MAX_PARALLEL
+from config import PROGRESS_STATUS_SHOW, TG_MAX_PARALLEL, TG_PROGRESS_MIN_INTERVAL
 from services.storage import (
     get_temp_batch_dir,
     move_batch_to_destination,
@@ -68,6 +68,29 @@ async def receive_file(
     await update_control_message(message, context)
 
 
+def _retry_after_seconds(error: RetryAfter) -> float:
+    value = error.retry_after
+    if hasattr(value, "total_seconds"):
+        return max(1.0, float(value.total_seconds()))
+    return max(1.0, float(value))
+
+
+def _set_flood_wait(context, error: RetryAfter) -> float:
+    seconds = _retry_after_seconds(error)
+    # Añadimos un pequeño margen para no golpear Telegram justo al vencer el límite.
+    until = time.monotonic() + seconds + 1.0
+    current = float(context.bot_data.get("telegram_flood_until", 0.0))
+    context.bot_data["telegram_flood_until"] = max(current, until)
+    print(f"⚠️ Telegram FloodWait: pausando actualizaciones UI {seconds:.0f} s.")
+    return seconds
+
+
+def _ui_flooded(context) -> bool:
+    return time.monotonic() < float(
+        context.bot_data.get("telegram_flood_until", 0.0)
+    )
+
+
 async def _send_control_message(context, chat_id: int, text: str, reply_markup=None):
     """Crea un mensaje de control. Un timeout no se considera prueba de fallo."""
     try:
@@ -76,6 +99,9 @@ async def _send_control_message(context, chat_id: int, text: str, reply_markup=N
             text=text,
             reply_markup=reply_markup,
         )
+    except RetryAfter as error:
+        _set_flood_wait(context, error)
+        return None
     except (TimedOut, NetworkError) as error:
         print(f"⚠️ Telegram no respondió al crear el mensaje de control: {error}")
         return None
@@ -96,6 +122,11 @@ async def _edit_or_recover_message(
     - BadRequest indicando que el mensaje ya no puede editarse/no existe:
       crea un mensaje nuevo y devuelve su ID.
     """
+    # Si Telegram ya nos pidió esperar, no hacemos ninguna llamada UI hasta
+    # que venza RetryAfter. Las descargas continúan independientemente.
+    if _ui_flooded(context):
+        return message_id
+
     if message_id is None:
         created = await _send_control_message(
             context, chat_id, text, reply_markup
@@ -109,6 +140,10 @@ async def _edit_or_recover_message(
             text=text,
             reply_markup=reply_markup,
         )
+        return message_id
+
+    except RetryAfter as error:
+        _set_flood_wait(context, error)
         return message_id
 
     except BadRequest as error:
@@ -203,16 +238,29 @@ async def _progress_loop(
     stop_event: asyncio.Event,
 ):
     """
-    Mantiene un único mensaje para el progreso del lote.
-    Los errores temporales de Telegram nunca detienen las descargas.
-    Si Telegram confirma que el mensaje ya no es editable, se crea otro.
+    Actualiza un único mensaje de progreso sin bombardear la Bot API.
+
+    En vez de editar cada 2 segundos por cualquier cambio de bytes, el estado
+    visible solo cambia cuando un archivo cruza un escalón de
+    PROGRESS_STATUS_SHOW (10 % por defecto), cuando cambia la cola/activos o
+    cuando termina una descarga. Además se impone un intervalo mínimo entre
+    ediciones y se respeta RetryAfter de Telegram.
     """
-    last_text = None
+    last_signature = None
+    last_edit_at = 0.0
 
     while not stop_event.is_set():
-        text = _build_status_text(state)
+        signature = _progress_signature(state)
+        now = time.monotonic()
 
-        if text != last_text:
+        can_edit = (
+            signature != last_signature
+            and not _ui_flooded(context)
+            and now - last_edit_at >= TG_PROGRESS_MIN_INTERVAL
+        )
+
+        if can_edit:
+            text = _build_status_text(state)
             old_id = state.get("status_message_id")
             new_id = await _edit_or_recover_message(
                 context=context,
@@ -223,27 +271,45 @@ async def _progress_loop(
             if new_id is not None:
                 state["status_message_id"] = new_id
 
-            # Solo damos la actualización por mostrada si conservamos un ID.
-            # En un timeout se reintentará con el siguiente cambio de progreso.
-            if new_id is not None:
-                last_text = text
+            # Aunque Telegram active FloodWait, esta firma queda pendiente:
+            # solo la marcamos como enviada si no estamos bloqueados.
+            if not _ui_flooded(context):
+                last_signature = signature
+                last_edit_at = time.monotonic()
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=2.0)
         except asyncio.TimeoutError:
             pass
 
-    text = _build_status_text(state)
-    if text != last_text:
-        new_id = await _edit_or_recover_message(
+    # No forzamos una edición si estamos bajo FloodWait. El llamador enviará
+    # el estado final cuando Telegram vuelva a admitir peticiones.
+    if not _ui_flooded(context):
+        text = _build_status_text(state)
+        await _edit_or_recover_message(
             context=context,
             chat_id=chat_id,
             message_id=state.get("status_message_id"),
             text=text,
         )
-        if new_id is not None:
-            state["status_message_id"] = new_id
 
+
+def _progress_signature(state: dict) -> tuple:
+    """Firma estable: el porcentaje solo cambia por escalones configurados."""
+    active_signature = []
+    for filename, item in sorted(state["active"].items()):
+        current = item.get("current", 0)
+        total = item.get("total", 0)
+        percentage = current * 100 / total if total else 0.0
+        bucket = int(percentage // PROGRESS_STATUS_SHOW) * PROGRESS_STATUS_SHOW
+        bucket = min(100, bucket)
+        active_signature.append((filename, bucket))
+
+    return (
+        state["completed"],
+        state["failed"],
+        tuple(active_signature),
+    )
 
 def _build_status_text(state: dict) -> str:
     total = state["total"]
@@ -297,6 +363,8 @@ async def finish_batch(
 
     try:
         await query.answer()
+    except RetryAfter as error:
+        _set_flood_wait(context, error)
     except (TimedOut, NetworkError) as error:
         print(f"⚠️ Timeout respondiendo al botón: {error}")
 
@@ -422,7 +490,11 @@ async def finish_batch(
         )
     finally:
         stop_event.set()
-        await progress_task
+        try:
+            await progress_task
+        except Exception as error:
+            # La UI nunca debe convertir una descarga correcta en un fallo.
+            print(f"⚠️ Error no crítico en la tarea de progreso: {error}")
 
     if errors:
         error_text = "\n".join(

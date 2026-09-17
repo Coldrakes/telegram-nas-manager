@@ -1,3 +1,6 @@
+import logging
+
+from telegram import Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -44,6 +47,14 @@ async def post_shutdown(application: Application):
     await telethon_downloader.stop()
 
 
+async def error_handler(update: object, context):
+    """Evita el aviso 'No error handlers are registered' y registra el fallo."""
+    logging.getLogger(__name__).error(
+        "Excepción no controlada procesando una actualización",
+        exc_info=context.error,
+    )
+
+
 def main():
 
     print("🚀 Iniciando bot...")
@@ -59,6 +70,7 @@ def main():
     )
 
     application.bot_data["allowed_users"] = ALLOWED_USERS
+    application.add_error_handler(error_handler)
 
     # Comandos
     application.add_handler(
