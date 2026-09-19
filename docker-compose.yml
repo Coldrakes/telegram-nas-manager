@@ -15,6 +15,7 @@ services:
       THREED_PATH: /data/3D
       TEMP_PATH: /data/temp
       TG_SESSION_PATH: /app/session/telegram_bot
+      TG_PROGRESS_INTERVAL: ${TG_PROGRESS_INTERVAL:-30}
 
     volumes:
       # Cambia estas rutas en .env por las rutas reales de tu NAS.

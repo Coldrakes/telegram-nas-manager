@@ -1,6 +1,6 @@
 import logging
 
-from telegram import Update
+from telegram import BotCommand, MenuButtonCommands, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -38,6 +38,17 @@ async def post_init(application: Application):
     event loop preparado.
     """
     await telethon_downloader.start()
+
+    # Menú nativo de Telegram junto a la barra de escritura.
+    await application.bot.set_my_commands([
+        BotCommand("start", "Abrir menú principal"),
+        BotCommand("peliculas", "Nuevo lote de películas"),
+        BotCommand("series", "Nuevo lote de series"),
+        BotCommand("3d", "Nuevo lote 3D"),
+    ])
+    await application.bot.set_chat_menu_button(
+        menu_button=MenuButtonCommands()
+    )
 
 
 async def post_shutdown(application: Application):

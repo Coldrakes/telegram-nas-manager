@@ -12,7 +12,7 @@ from telegram import (
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
-from config import PROGRESS_STATUS_SHOW, TG_MAX_PARALLEL, TG_PROGRESS_MIN_INTERVAL
+from config import TG_MAX_PARALLEL, TG_PROGRESS_INTERVAL
 from services.storage import (
     get_temp_batch_dir,
     move_batch_to_destination,
@@ -174,6 +174,44 @@ async def _edit_or_recover_message(
         return message_id
 
 
+async def _replace_status_message(
+    context,
+    chat_id: int,
+    old_message_id: int | None,
+    text: str,
+    reply_markup=None,
+) -> int | None:
+    """Publica el estado como mensaje nuevo para mantenerlo al final del chat.
+
+    Primero crea el nuevo mensaje y solo después intenta borrar el anterior. Si
+    Telegram está en FloodWait o hay un error temporal, se conserva el mensaje
+    anterior y la descarga/lote continúa sin verse afectado.
+    """
+    if _ui_flooded(context):
+        return old_message_id
+
+    created = await _send_control_message(context, chat_id, text, reply_markup)
+    if created is None:
+        return old_message_id
+
+    new_id = created.message_id
+
+    if old_message_id and old_message_id != new_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=old_message_id)
+        except RetryAfter as error:
+            _set_flood_wait(context, error)
+        except BadRequest as error:
+            # Si ya fue borrado, no hay nada que hacer.
+            description = str(error).lower()
+            if "message to delete not found" not in description and "message can't be deleted" not in description:
+                print(f"⚠️ No se pudo borrar el mensaje anterior {old_message_id}: {error}")
+        except (TimedOut, NetworkError) as error:
+            print(f"⚠️ Error temporal borrando el mensaje anterior {old_message_id}: {error}")
+
+    return new_id
+
+
 async def update_control_message(message, context):
     files = context.user_data.get("files", {})
     mode = context.user_data.get("mode")
@@ -209,10 +247,10 @@ async def update_control_message(message, context):
     )
 
     control_id = context.user_data.get("control_message_id")
-    new_id = await _edit_or_recover_message(
+    new_id = await _replace_status_message(
         context=context,
         chat_id=message.chat_id,
-        message_id=control_id,
+        old_message_id=control_id,
         text=text,
         reply_markup=keyboard,
     )
@@ -237,79 +275,35 @@ async def _progress_loop(
     state: dict,
     stop_event: asyncio.Event,
 ):
-    """
-    Actualiza un único mensaje de progreso sin bombardear la Bot API.
+    """Publica el progreso cada TG_PROGRESS_INTERVAL segundos.
 
-    En vez de editar cada 2 segundos por cualquier cambio de bytes, el estado
-    visible solo cambia cuando un archivo cruza un escalón de
-    PROGRESS_STATUS_SHOW (10 % por defecto), cuando cambia la cola/activos o
-    cuando termina una descarga. Además se impone un intervalo mínimo entre
-    ediciones y se respeta RetryAfter de Telegram.
+    Cada actualización crea un mensaje nuevo y después elimina el anterior para
+    que el estado quede entre los mensajes más recientes. RetryAfter, timeouts y
+    errores de red afectan solo a la UI; Telethon sigue descargando.
     """
-    last_signature = None
-    last_edit_at = 0.0
-
     while not stop_event.is_set():
-        signature = _progress_signature(state)
-        now = time.monotonic()
-
-        can_edit = (
-            signature != last_signature
-            and not _ui_flooded(context)
-            and now - last_edit_at >= TG_PROGRESS_MIN_INTERVAL
-        )
-
-        if can_edit:
-            text = _build_status_text(state)
-            old_id = state.get("status_message_id")
-            new_id = await _edit_or_recover_message(
-                context=context,
-                chat_id=chat_id,
-                message_id=old_id,
-                text=text,
-            )
-            if new_id is not None:
-                state["status_message_id"] = new_id
-
-            # Aunque Telegram active FloodWait, esta firma queda pendiente:
-            # solo la marcamos como enviada si no estamos bloqueados.
-            if not _ui_flooded(context):
-                last_signature = signature
-                last_edit_at = time.monotonic()
-
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=TG_PROGRESS_INTERVAL,
+            )
+            break
         except asyncio.TimeoutError:
             pass
 
-    # No forzamos una edición si estamos bajo FloodWait. El llamador enviará
-    # el estado final cuando Telegram vuelva a admitir peticiones.
-    if not _ui_flooded(context):
+        if _ui_flooded(context):
+            continue
+
         text = _build_status_text(state)
-        await _edit_or_recover_message(
+        new_id = await _replace_status_message(
             context=context,
             chat_id=chat_id,
-            message_id=state.get("status_message_id"),
+            old_message_id=state.get("status_message_id"),
             text=text,
         )
+        if new_id is not None:
+            state["status_message_id"] = new_id
 
-
-def _progress_signature(state: dict) -> tuple:
-    """Firma estable: el porcentaje solo cambia por escalones configurados."""
-    active_signature = []
-    for filename, item in sorted(state["active"].items()):
-        current = item.get("current", 0)
-        total = item.get("total", 0)
-        percentage = current * 100 / total if total else 0.0
-        bucket = int(percentage // PROGRESS_STATUS_SHOW) * PROGRESS_STATUS_SHOW
-        bucket = min(100, bucket)
-        active_signature.append((filename, bucket))
-
-    return (
-        state["completed"],
-        state["failed"],
-        tuple(active_signature),
-    )
 
 def _build_status_text(state: dict) -> str:
     total = state["total"]
@@ -407,10 +401,10 @@ async def finish_batch(
         f"🔄 Descargas activas: 0/{TG_MAX_PARALLEL}\n"
         f"⏳ En cola: {total_files}"
     )
-    recovered_id = await _edit_or_recover_message(
+    recovered_id = await _replace_status_message(
         context=context,
         chat_id=query.message.chat_id,
-        message_id=state["status_message_id"],
+        old_message_id=state["status_message_id"],
         text=initial_text,
     )
     if recovered_id is not None:
@@ -509,7 +503,7 @@ async def finish_batch(
             "Los archivos descargados permanecen en la carpeta temporal "
             "y NO se han movido al NAS."
         )
-        await _edit_or_recover_message(
+        await _replace_status_message(
             context, query.message.chat_id, state.get("status_message_id"),
             final_error_text,
         )
@@ -520,7 +514,7 @@ async def finish_batch(
         f"✅ {state['completed']}/{total_files} archivos descargados.\n\n"
         f"💾 Organizando en {destination_name}..."
     )
-    recovered_id = await _edit_or_recover_message(
+    recovered_id = await _replace_status_message(
         context, query.message.chat_id, state.get("status_message_id"),
         organizing_text,
     )
@@ -537,7 +531,7 @@ async def finish_batch(
             f"• {error}" for error in move_errors
         )
 
-        await _edit_or_recover_message(
+        await _replace_status_message(
             context, query.message.chat_id, state.get("status_message_id"),
             (
                 f"⚠️ LOTE PROCESADO CON ERRORES\n\n"
@@ -547,7 +541,7 @@ async def finish_batch(
             ),
         )
     else:
-        await _edit_or_recover_message(
+        await _replace_status_message(
             context, query.message.chat_id, state.get("status_message_id"),
             (
                 f"🎉 LOTE COMPLETADO\n\n"

@@ -204,3 +204,12 @@ telegram-nas-manager/
     ├── series_organizer.py
     └── three_d_organizer.py
 ```
+
+
+## Interfaz y progreso
+
+- El progreso visible se actualiza por tiempo, cada `TG_PROGRESS_INTERVAL` segundos (30 por defecto).
+- Cada actualización crea primero un mensaje nuevo y después elimina el anterior, para mantener el estado al final del chat.
+- Los eventos importantes (inicio, organización y final) se publican inmediatamente.
+- `RetryAfter`, `TimedOut` y `NetworkError` de la Bot API no detienen las descargas de Telethon.
+- El bot configura el botón nativo **Menú** de Telegram con `/start`, `/peliculas`, `/series` y `/3d`.
