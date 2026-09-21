@@ -37,6 +37,8 @@ async def receive_file(
     if not user:
         return
 
+    context.user_data["last_user_message_id"] = message.message_id
+
     if user.id not in context.bot_data["allowed_users"]:
         await message.reply_text("⛔ No estás autorizado.")
         return
@@ -212,6 +214,27 @@ async def _replace_status_message(
     return new_id
 
 
+async def track_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recuerda el último mensaje entrante para saber si el estado sigue abajo."""
+    message = update.effective_message
+    if message:
+        context.user_data["last_user_message_id"] = message.message_id
+
+
+async def _smart_status_message(
+    context, chat_id: int, message_id: int | None, text: str, reply_markup=None
+) -> int | None:
+    """Edita mientras el estado siga siendo el último; si quedó arriba, lo recoloca."""
+    last_user_id = int(context.user_data.get("last_user_message_id", 0) or 0)
+    if message_id is None or last_user_id > message_id:
+        return await _replace_status_message(
+            context, chat_id, message_id, text, reply_markup
+        )
+    return await _edit_or_recover_message(
+        context, chat_id, message_id, text, reply_markup
+    )
+
+
 async def update_control_message(message, context):
     files = context.user_data.get("files", {})
     mode = context.user_data.get("mode")
@@ -247,10 +270,10 @@ async def update_control_message(message, context):
     )
 
     control_id = context.user_data.get("control_message_id")
-    new_id = await _replace_status_message(
+    new_id = await _smart_status_message(
         context=context,
         chat_id=message.chat_id,
-        old_message_id=control_id,
+        message_id=control_id,
         text=text,
         reply_markup=keyboard,
     )
@@ -295,10 +318,10 @@ async def _progress_loop(
             continue
 
         text = _build_status_text(state)
-        new_id = await _replace_status_message(
+        new_id = await _smart_status_message(
             context=context,
             chat_id=chat_id,
-            old_message_id=state.get("status_message_id"),
+            message_id=state.get("status_message_id"),
             text=text,
         )
         if new_id is not None:
@@ -401,10 +424,10 @@ async def finish_batch(
         f"🔄 Descargas activas: 0/{TG_MAX_PARALLEL}\n"
         f"⏳ En cola: {total_files}"
     )
-    recovered_id = await _replace_status_message(
+    recovered_id = await _smart_status_message(
         context=context,
         chat_id=query.message.chat_id,
-        old_message_id=state["status_message_id"],
+        message_id=state["status_message_id"],
         text=initial_text,
     )
     if recovered_id is not None:
@@ -503,7 +526,7 @@ async def finish_batch(
             "Los archivos descargados permanecen en la carpeta temporal "
             "y NO se han movido al NAS."
         )
-        await _replace_status_message(
+        await _edit_or_recover_message(
             context, query.message.chat_id, state.get("status_message_id"),
             final_error_text,
         )
@@ -514,7 +537,7 @@ async def finish_batch(
         f"✅ {state['completed']}/{total_files} archivos descargados.\n\n"
         f"💾 Organizando en {destination_name}..."
     )
-    recovered_id = await _replace_status_message(
+    recovered_id = await _smart_status_message(
         context, query.message.chat_id, state.get("status_message_id"),
         organizing_text,
     )
@@ -531,7 +554,7 @@ async def finish_batch(
             f"• {error}" for error in move_errors
         )
 
-        await _replace_status_message(
+        await _edit_or_recover_message(
             context, query.message.chat_id, state.get("status_message_id"),
             (
                 f"⚠️ LOTE PROCESADO CON ERRORES\n\n"
@@ -541,7 +564,7 @@ async def finish_batch(
             ),
         )
     else:
-        await _replace_status_message(
+        await _edit_or_recover_message(
             context, query.message.chat_id, state.get("status_message_id"),
             (
                 f"🎉 LOTE COMPLETADO\n\n"

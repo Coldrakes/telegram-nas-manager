@@ -11,10 +11,10 @@ from config import (
     API_HASH,
     API_ID,
     BOT_TOKEN,
-    TG_DL_TIMEOUT,
+    TG_DL_RETRIES,
+    TG_DL_STALL_TIMEOUT,
     TG_SESSION_PATH,
 )
-
 
 ProgressCallback = Callable[[int, int], Awaitable[None]]
 
@@ -23,28 +23,17 @@ class TelethonDownloader:
     """Cliente Telethon usado exclusivamente para descargar archivos."""
 
     def __init__(self):
-        self.client = TelegramClient(
-            TG_SESSION_PATH,
-            API_ID,
-            API_HASH,
-        )
+        self.client = TelegramClient(TG_SESSION_PATH, API_ID, API_HASH)
         self._started = False
 
     async def start(self) -> None:
         if self._started:
             return
-
-        Path(TG_SESSION_PATH).parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
+        Path(TG_SESSION_PATH).parent.mkdir(parents=True, exist_ok=True)
         await self.client.start(bot_token=BOT_TOKEN)
         self._started = True
-
         me = await self.client.get_me()
         username = f"@{me.username}" if me.username else "(sin username)"
-
         print("🔌 Telethon integrado.")
         print(f"🤖 Bot: {me.first_name}")
         print(f"🆔 ID: {me.id}")
@@ -65,83 +54,105 @@ class TelethonDownloader:
         if not self._started:
             raise RuntimeError("Telethon no está iniciado.")
 
-        message = await self.client.get_messages(
-            chat_id,
-            ids=message_id,
-        )
-
+        message = await self.client.get_messages(chat_id, ids=message_id)
         if not message:
-            raise RuntimeError(
-                "Telethon no pudo localizar el mensaje recibido."
-            )
-
+            raise RuntimeError("Telethon no pudo localizar el mensaje recibido.")
         if not message.file:
-            raise RuntimeError(
-                "El mensaje no contiene un archivo descargable."
-            )
+            raise RuntimeError("El mensaje no contiene un archivo descargable.")
 
-        destination.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        last_error: Exception | None = None
 
-        callback = None
-
-        if progress_callback is not None:
+        for attempt in range(TG_DL_RETRIES + 1):
+            last_progress_at = time.monotonic()
+            last_bytes = 0
             last_report = 0.0
 
             def telethon_progress(current: int, total: int) -> None:
-                nonlocal last_report
-
+                nonlocal last_progress_at, last_bytes, last_report
                 now = time.monotonic()
-
-                if (
-                    total > 0
-                    and current < total
-                    and now - last_report < 2.0
-                ):
+                if current > last_bytes:
+                    last_bytes = current
+                    last_progress_at = now
+                if progress_callback is None:
                     return
-
+                if total > 0 and current < total and now - last_report < 2.0:
+                    return
                 last_report = now
-
                 try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(
+                    asyncio.get_running_loop().create_task(
                         progress_callback(current, total)
                     )
                 except RuntimeError:
                     pass
 
-            callback = telethon_progress
-
-        try:
-            downloaded = await asyncio.wait_for(
+            download_task = asyncio.create_task(
                 self.client.download_media(
                     message,
                     file=str(destination),
-                    progress_callback=callback,
-                ),
-                timeout=TG_DL_TIMEOUT,
-            )
-        except asyncio.TimeoutError as error:
-            raise TimeoutError(
-                f"La descarga superó el tiempo máximo de "
-                f"{TG_DL_TIMEOUT} segundos."
-            ) from error
-
-        if not downloaded:
-            raise RuntimeError(
-                "Telethon no devolvió una ruta de archivo descargado."
+                    progress_callback=telethon_progress,
+                )
             )
 
-        result = Path(downloaded)
+            try:
+                while not download_task.done():
+                    await asyncio.sleep(min(5.0, max(1.0, TG_DL_STALL_TIMEOUT / 10)))
+                    if time.monotonic() - last_progress_at > TG_DL_STALL_TIMEOUT:
+                        download_task.cancel()
+                        try:
+                            await download_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise TimeoutError(
+                            f"La descarga no mostró progreso durante "
+                            f"{TG_DL_STALL_TIMEOUT} segundos."
+                        )
 
-        if not result.exists():
-            raise RuntimeError(
-                "La descarga terminó pero el archivo no existe en disco."
-            )
+                downloaded = await download_task
+                if not downloaded:
+                    raise RuntimeError(
+                        "Telethon no devolvió una ruta de archivo descargado."
+                    )
 
-        return result
+                result = Path(downloaded)
+                if not result.exists():
+                    raise RuntimeError(
+                        "La descarga terminó pero el archivo no existe en disco."
+                    )
+                return result
+
+            except asyncio.CancelledError:
+                if not download_task.done():
+                    download_task.cancel()
+                raise
+            except Exception as error:
+                last_error = error
+                if not download_task.done():
+                    download_task.cancel()
+                    try:
+                        await download_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                if attempt >= TG_DL_RETRIES:
+                    break
+
+                print(
+                    f"⚠️ Descarga fallida/bloqueada: {destination.name}. "
+                    f"Reintento {attempt + 1}/{TG_DL_RETRIES}: {error}"
+                )
+                # download_media no garantiza reanudación sobre un parcial.
+                # Se elimina antes de reintentar para evitar archivos corruptos.
+                if destination.exists():
+                    try:
+                        destination.unlink()
+                    except OSError:
+                        pass
+                await asyncio.sleep(min(5, attempt + 1))
+
+        raise RuntimeError(
+            f"La descarga falló tras {TG_DL_RETRIES + 1} intento(s): {last_error}"
+        ) from last_error
 
 
 telethon_downloader = TelethonDownloader()

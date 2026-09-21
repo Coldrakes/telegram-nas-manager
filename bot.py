@@ -26,6 +26,7 @@ from handlers.commands import (
 from handlers.files import (
     finish_batch,
     receive_file,
+    track_user_message,
 )
 
 from services.storage import prepare_directories
@@ -128,6 +129,13 @@ def main():
             filters.Document.ALL,
             receive_file
         )
+    )
+
+    # Grupo separado: registra cualquier mensaje del usuario incluso si otro
+    # handler (comando/documento) ya lo procesó en el grupo principal.
+    application.add_handler(
+        MessageHandler(filters.ALL, track_user_message),
+        group=1,
     )
 
     print("🤖 Bot iniciado.")

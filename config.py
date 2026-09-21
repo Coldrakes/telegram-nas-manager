@@ -60,9 +60,14 @@ TG_MAX_PARALLEL = max(
     int(os.getenv("TG_MAX_PARALLEL", "3")),
 )
 
-TG_DL_TIMEOUT = max(
-    1,
-    int(os.getenv("TG_DL_TIMEOUT", "3600")),
+TG_DL_STALL_TIMEOUT = max(
+    30,
+    int(os.getenv("TG_DL_STALL_TIMEOUT", "600")),
+)
+
+TG_DL_RETRIES = max(
+    0,
+    int(os.getenv("TG_DL_RETRIES", "2")),
 )
 
 TG_PROGRESS_DOWNLOAD = (
