@@ -214,3 +214,30 @@ telegram-nas-manager/
 - Los eventos importantes (inicio, organización y final) se publican inmediatamente.
 - `RetryAfter`, `TimedOut` y `NetworkError` de la Bot API no detienen las descargas de Telethon.
 - El bot configura el botón nativo **Menú** de Telegram con `/start`, `/peliculas`, `/series` y `/3d`.
+
+## Sincronización de canales y descompresión automática
+
+El bot incluye `/canal` y el botón **📡 Sincronizar canal**. Esta función recorre los archivos nuevos de un canal y recuerda el último mensaje sincronizado en `/app/session/channel_sync.json`, por lo que las siguientes ejecuciones solo procesan contenido posterior.
+
+### Autorizar la cuenta que puede leer los canales
+
+Las descargas normales siguen usando la sesión del bot. El historial completo de canales usa una segunda sesión Telethon de **usuario**. La cuenta debe pertenecer al canal (también funciona con canales privados a los que tenga acceso).
+
+Con el contenedor creado, ejecuta una sola vez:
+
+```bash
+docker exec -it telegram-nas-manager python tools/create_channel_session.py
+```
+
+Telegram solicitará el teléfono, código de inicio de sesión y, si procede, la contraseña 2FA. La sesión queda persistida en el volumen `SESSION_HOST_PATH`. Reinicia después el contenedor.
+
+### Descompresión
+
+`AUTO_EXTRACT=True` activa la extracción automática al terminar completamente un lote o una sincronización. `DELETE_ARCHIVES_AFTER_EXTRACT=True` elimina los comprimidos **solo después** de que `7z` haya superado la prueba de integridad y la extracción haya terminado correctamente.
+
+Se contemplan RAR, ZIP y 7z simples y multipartes, incluyendo `part01.rar`, `.rar + .r00/.r01`, `.z01/.z02 + .zip`, `.7z.001/.002` y `.zip.001/.002`. Si falta una parte, hay corrupción o falla la extracción, los comprimidos se conservan y el lote no se mueve al NAS.
+
+## Canales grandes: cola persistente SQLite
+La sincronización de canales indexa los mensajes directamente en `/app/data/coldnas.db` y procesa una cola limitada por bloques. El estado sobrevive a reinicios si `DATA_HOST_PATH` está montado. SQLite usa WAL; no requiere servidor, puerto ni credenciales. Los estados por mensaje son `pending`, `downloading`, `downloaded`, `completed` y `error`. Una descarga se escribe primero como `.part` y solo se renombra al terminar. Antes de cada bloque se comprueba espacio libre de TEMP y NAS.
+
+Variables recomendadas: `CHANNEL_BATCH_SIZE=20`, `TG_MAX_PARALLEL=3`, `CHANNEL_MAX_RETRIES=5`, `CHANNEL_MIN_TEMP_FREE_GB=20`, `CHANNEL_MIN_NAS_FREE_GB=50`.

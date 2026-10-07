@@ -15,6 +15,7 @@ from config import (
 )
 
 from handlers.commands import (
+    action_callback,
     cancel_batch,
     mode_callback,
     movies,
@@ -31,6 +32,9 @@ from handlers.files import (
 
 from services.storage import prepare_directories
 from services.telethon_downloader import telethon_downloader
+from services.channel_downloader import channel_downloader
+from services.channel_db import channel_db
+from handlers.channels import channel_start, channel_callback, receive_channel_reference
 
 
 async def post_init(application: Application):
@@ -38,7 +42,10 @@ async def post_init(application: Application):
     Inicializa Telethon cuando python-telegram-bot ya tiene su
     event loop preparado.
     """
+    channel_db.init()
+    channel_db.reset_interrupted()
     await telethon_downloader.start()
+    await channel_downloader.start()
 
     # Menú nativo de Telegram junto a la barra de escritura.
     await application.bot.set_my_commands([
@@ -46,6 +53,7 @@ async def post_init(application: Application):
         BotCommand("peliculas", "Nuevo lote de películas"),
         BotCommand("series", "Nuevo lote de series"),
         BotCommand("3d", "Nuevo lote 3D"),
+        BotCommand("canal", "Sincronizar archivos de un canal"),
     ])
     await application.bot.set_chat_menu_button(
         menu_button=MenuButtonCommands()
@@ -56,6 +64,7 @@ async def post_shutdown(application: Application):
     """
     Cierra correctamente la sesión de Telethon al apagar el bot.
     """
+    await channel_downloader.stop()
     await telethon_downloader.stop()
 
 
@@ -101,7 +110,21 @@ def main():
         CommandHandler("3d", three_d)
     )
 
+    application.add_handler(
+        CommandHandler("canal", channel_start)
+    )
+
     # Botones
+    application.add_handler(
+        CallbackQueryHandler(action_callback, pattern=r"^action:files$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(channel_start, pattern=r"^channel:start$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(channel_callback, pattern=r"^channel:(?:dest:|cancel)")
+    )
+
     application.add_handler(
         CallbackQueryHandler(
             mode_callback,
@@ -121,6 +144,12 @@ def main():
             cancel_batch,
             pattern=r"^batch:cancel$"
         )
+    )
+
+    # Referencia de canal (solo cuando /canal está esperando un enlace)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_reference),
+        group=-1,
     )
 
     # Archivos

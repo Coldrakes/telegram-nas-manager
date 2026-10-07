@@ -5,13 +5,7 @@ from config import MOVIES_PATH, SERIES_PATH, TEMP_PATH, THREED_PATH
 from services.series_organizer import extract_series_name
 from services.three_d_organizer import extract_3d_name
 
-
-DESTINATIONS = {
-    "movies": Path(MOVIES_PATH),
-    "series": Path(SERIES_PATH),
-    "3d": Path(THREED_PATH),
-}
-
+DESTINATIONS = {"movies": Path(MOVIES_PATH), "series": Path(SERIES_PATH), "3d": Path(THREED_PATH)}
 TEMP_DIR = Path(TEMP_PATH)
 
 
@@ -44,11 +38,7 @@ def get_unique_filename(directory: Path, filename: str) -> Path:
     candidate = directory / original.name
     if not candidate.exists():
         return candidate
-
-    stem = original.stem
-    suffix = original.suffix
-    counter = 1
-
+    stem, suffix, counter = original.stem, original.suffix, 1
     while True:
         candidate = directory / f"{stem} ({counter}){suffix}"
         if not candidate.exists():
@@ -68,35 +58,23 @@ def move_batch_to_destination(user_id: int, mode: str) -> tuple[int, list[str]]:
     source_dir = get_temp_batch_dir(user_id)
     destination_dir = get_destination(mode)
     destination_dir.mkdir(parents=True, exist_ok=True)
+    entries = list(source_dir.iterdir())
+    moved, errors = 0, []
 
-    files = [file for file in source_dir.iterdir() if file.is_file()]
-    moved = 0
-    errors = []
-
-    for source_file in files:
+    for source in entries:
         try:
-            target_dir = _get_file_destination(
-                destination_dir,
-                mode,
-                source_file.name,
-            )
+            # Las carpetas creadas por un comprimido se conservan como unidad.
+            # Los archivos sueltos mantienen la organización Series/3D existente.
+            target_dir = destination_dir if source.is_dir() else _get_file_destination(destination_dir, mode, source.name)
             target_dir.mkdir(parents=True, exist_ok=True)
-
-            destination_file = get_unique_filename(
-                target_dir,
-                source_file.name,
-            )
-
-            shutil.move(str(source_file), str(destination_file))
+            destination = get_unique_filename(target_dir, source.name)
+            shutil.move(str(source), str(destination))
             moved += 1
-
         except Exception as error:
-            errors.append(f"{source_file.name}: {error}")
+            errors.append(f"{source.name}: {error}")
 
-    # La carpeta temporal del lote se puede eliminar si quedó vacía.
     try:
         source_dir.rmdir()
     except OSError:
         pass
-
     return moved, errors

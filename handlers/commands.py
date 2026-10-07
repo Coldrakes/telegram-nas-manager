@@ -18,17 +18,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Descargar ficheros", callback_data="action:files")],
+        [InlineKeyboardButton("📡 Sincronizar canal", callback_data="channel:start")],
+    ])
+
+    await update.message.reply_text(
+        "👋 Hola.\n\nSelecciona qué quieres hacer:",
+        reply_markup=keyboard,
+    )
+
+
+async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    user = query.from_user
+    if not is_authorized(user.id, context.bot_data["allowed_users"]):
+        await query.edit_message_text("⛔ No estás autorizado.")
+        return
+    if query.data != "action:files":
+        return
+    keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎬 Películas", callback_data="mode:movies"),
             InlineKeyboardButton("📺 Series", callback_data="mode:series"),
         ],
-        [
-            InlineKeyboardButton("🧊 3D", callback_data="mode:3d"),
-        ],
+        [InlineKeyboardButton("🧊 3D", callback_data="mode:3d")],
     ])
-
-    await update.message.reply_text(
-        "👋 Hola.\n\nSelecciona qué quieres enviar:",
+    await query.edit_message_text(
+        "📥 DESCARGAR FICHEROS\n\nSelecciona dónde quieres guardar el lote:",
         reply_markup=keyboard,
     )
 
