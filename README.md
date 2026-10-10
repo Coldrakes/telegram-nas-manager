@@ -255,3 +255,12 @@ No se aceptan enlaces arbitrarios desde el chat.
 5. Abre `/canal` y selecciona **Cajon Peliculas HD**.
 
 **Seguridad:** este flujo es experimental. Los códigos y contraseñas atraviesan el chat de Telegram; se intenta borrar cada mensaje sensible, pero no se garantiza su eliminación de todos los dispositivos o registros. Usa una cuenta de pruebas y migra después a un flujo local seguro. El fichero `.session` concede acceso a la cuenta: protege el volumen persistente y no lo publiques en Git.
+
+## Vincular cuenta mediante QR (experimental)
+
+Desde el chat privado autorizado, ejecuta `/sesion` y pulsa **Vincular mediante QR**.
+En la app de Telegram del móvil entra en **Ajustes → Dispositivos → Vincular dispositivo**
+y escanea la imagen. El QR se renueva al caducar y se elimina al finalizar.
+Si Telegram solicita contraseña de verificación en dos pasos, el bot la recibe temporalmente
+por chat y trata de borrar el mensaje: no es un canal adecuado para credenciales en producción.
+No envíes códigos de inicio de sesión al bot. La sesión persistente se guarda según `CHANNEL_SESSION_PATH`.
