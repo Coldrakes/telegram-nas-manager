@@ -34,7 +34,8 @@ from services.storage import prepare_directories
 from services.telethon_downloader import telethon_downloader
 from services.channel_downloader import channel_downloader
 from services.channel_db import channel_db
-from handlers.channels import channel_start, channel_callback, receive_channel_reference
+from handlers.channels import channel_start, channel_callback
+from handlers.session import session_menu, session_callback, session_text
 
 
 async def post_init(application: Application):
@@ -54,6 +55,7 @@ async def post_init(application: Application):
         BotCommand("series", "Nuevo lote de series"),
         BotCommand("3d", "Nuevo lote 3D"),
         BotCommand("canal", "Sincronizar archivos de un canal"),
+        BotCommand("sesion", "Configurar sesión de Telegram"),
     ])
     await application.bot.set_chat_menu_button(
         menu_button=MenuButtonCommands()
@@ -114,6 +116,8 @@ def main():
         CommandHandler("canal", channel_start)
     )
 
+    application.add_handler(CommandHandler("sesion", session_menu))
+
     # Botones
     application.add_handler(
         CallbackQueryHandler(action_callback, pattern=r"^action:files$")
@@ -122,8 +126,11 @@ def main():
         CallbackQueryHandler(channel_start, pattern=r"^channel:start$")
     )
     application.add_handler(
-        CallbackQueryHandler(channel_callback, pattern=r"^channel:(?:dest:|cancel)")
+        CallbackQueryHandler(channel_callback, pattern=r"^channel:(?:run:|cancel)")
     )
+
+    application.add_handler(CallbackQueryHandler(session_menu, pattern=r"^session:menu$"))
+    application.add_handler(CallbackQueryHandler(session_callback, pattern=r"^session:(?:login|check|logout|cancel)$"))
 
     application.add_handler(
         CallbackQueryHandler(
@@ -148,7 +155,7 @@ def main():
 
     # Referencia de canal (solo cuando /canal está esperando un enlace)
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_reference),
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, session_text),
         group=-1,
     )
 

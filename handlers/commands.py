@@ -20,6 +20,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 Descargar ficheros", callback_data="action:files")],
         [InlineKeyboardButton("📡 Sincronizar canal", callback_data="channel:start")],
+        [InlineKeyboardButton("⚙️ Configuración", callback_data="session:menu")],
     ])
 
     await update.message.reply_text(

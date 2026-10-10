@@ -241,3 +241,17 @@ Se contemplan RAR, ZIP y 7z simples y multipartes, incluyendo `part01.rar`, `.ra
 La sincronización de canales indexa los mensajes directamente en `/app/data/coldnas.db` y procesa una cola limitada por bloques. El estado sobrevive a reinicios si `DATA_HOST_PATH` está montado. SQLite usa WAL; no requiere servidor, puerto ni credenciales. Los estados por mensaje son `pending`, `downloading`, `downloaded`, `completed` y `error`. Una descarga se escribe primero como `.part` y solo se renombra al terminar. Antes de cada bloque se comprueba espacio libre de TEMP y NAS.
 
 Variables recomendadas: `CHANNEL_BATCH_SIZE=20`, `TG_MAX_PARALLEL=3`, `CHANNEL_MAX_RETRIES=5`, `CHANNEL_MIN_TEMP_FREE_GB=20`, `CHANNEL_MIN_NAS_FREE_GB=50`.
+
+## Canales fijos y vinculación por chat (versión experimental)
+
+Los canales autorizados se configuran exclusivamente en `services/allowed_channels.py`.
+El canal inicial **Cajon Peliculas HD** se sincroniza en `MOVIES_PATH`.
+No se aceptan enlaces arbitrarios desde el chat.
+
+1. Asegura `API_ID`, `API_HASH`, `BOT_TOKEN` y `ALLOWED_USERS` en `.env`.
+2. Inicia el bot y abre `/sesion` en un chat privado desde un usuario autorizado.
+3. Pulsa **Vincular cuenta** e introduce teléfono, código y, si procede, contraseña 2FA.
+4. Pulsa **Comprobar acceso**: la cuenta debe ser miembro del canal privado.
+5. Abre `/canal` y selecciona **Cajon Peliculas HD**.
+
+**Seguridad:** este flujo es experimental. Los códigos y contraseñas atraviesan el chat de Telegram; se intenta borrar cada mensaje sensible, pero no se garantiza su eliminación de todos los dispositivos o registros. Usa una cuenta de pruebas y migra después a un flujo local seguro. El fichero `.session` concede acceso a la cuenta: protege el volumen persistente y no lo publiques en Git.

@@ -1,5 +1,7 @@
 from pathlib import Path
 from telethon import TelegramClient
+from telethon.tl.functions.messages import CheckChatInviteRequest
+from telethon.tl.types import ChatInviteAlready
 from config import API_HASH,API_ID,CHANNEL_SESSION_PATH,CHANNEL_SCAN_PAGE_SIZE
 from services.channel_db import channel_db
 class ChannelDownloader:
@@ -12,6 +14,18 @@ class ChannelDownloader:
   self._started=False
  @property
  def available(self):return self._started
+ async def logout(self):
+  if self.client.is_connected():
+   await self.client.log_out()
+  self._started=False
+  self.client=TelegramClient(CHANNEL_SESSION_PATH,API_ID,API_HASH)
+ async def resolve_allowed(self,item):
+  """Comprueba pertenencia al canal privado, sin unirse automáticamente."""
+  ref=item['invite_link'];invite_hash=ref.rsplit('+',1)[-1]
+  result=await self.client(CheckChatInviteRequest(invite_hash))
+  if not isinstance(result,ChatInviteAlready):
+   raise PermissionError('La cuenta no pertenece al canal autorizado.')
+  return result.chat
  async def scan_to_db(self,ref,dest,progress=None):
   if not self._started:raise RuntimeError('La sesión de usuario para canales no está autorizada.')
   e=await self.client.get_entity(ref.strip());cid=int(e.id);title=getattr(e,'title',None) or ref;channel_db.upsert_channel(cid,title,ref,dest);n=0

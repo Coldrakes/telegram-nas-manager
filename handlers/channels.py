@@ -12,36 +12,50 @@ from services.storage import clear_temp_batch,get_temp_batch_dir,get_destination
 def _authorized(u,c):return bool(u.effective_user and u.effective_user.id in c.bot_data['allowed_users'])
 def _free_gb(p):return shutil.disk_usage(p).free/(1024**3)
 
+from services.allowed_channels import CHANNELS
+
 async def channel_start(update:Update,context:ContextTypes.DEFAULT_TYPE):
  m=update.effective_message
  if not m or not _authorized(update,context):return
  if update.callback_query:await update.callback_query.answer()
  if not channel_downloader.available:
-  await m.reply_text('⚠️ La sesión de usuario para canales no está autorizada.\nEjecuta: python tools/create_channel_session.py');return
- context.user_data.clear();kb=InlineKeyboardMarkup([[InlineKeyboardButton('🎬 Películas',callback_data='channel:dest:movies'),InlineKeyboardButton('📺 Series',callback_data='channel:dest:series')],[InlineKeyboardButton('🧊 3D',callback_data='channel:dest:3d'),InlineKeyboardButton('❌ Cancelar',callback_data='channel:cancel')]])
- text='📡 SINCRONIZAR CANAL\n\nSelecciona dónde quieres guardar los archivos:'
- if update.callback_query:await update.callback_query.edit_message_text(text,reply_markup=kb)
- else:await m.reply_text(text,reply_markup=kb)
+  await m.reply_text('⚠️ Primero vincula la cuenta en ⚙️ Configuración → Sesión de Telegram.');return
+ buttons=[[InlineKeyboardButton(f"🎬 {item['name']}",callback_data=f'channel:run:{key}')] for key,item in CHANNELS.items()]
+ buttons.append([InlineKeyboardButton('❌ Cancelar',callback_data='channel:cancel')])
+ kb=InlineKeyboardMarkup(buttons)
+ if update.callback_query:await update.callback_query.edit_message_text('📡 Selecciona un canal autorizado:',reply_markup=kb)
+ else:await m.reply_text('📡 Selecciona un canal autorizado:',reply_markup=kb)
+
 async def channel_callback(update,context):
  q=update.callback_query
  if not q or not _authorized(update,context):return
  await q.answer();d=q.data or ''
- if d=='channel:cancel':context.user_data.clear();await q.edit_message_text('❌ Sincronización cancelada.');return
- if not d.startswith('channel:dest:'):return
- mode=d.rsplit(':',1)[1];context.user_data.clear();context.user_data.update(channel_mode=mode,awaiting_channel=True)
- await q.edit_message_text('📡 SINCRONIZAR CANAL\n\nEnvíame el enlace o @usuario del canal.\nEl historial se indexará directamente en SQLite sin cargarlo entero en memoria.')
+ if d=='channel:cancel':await q.edit_message_text('❌ Cancelado.');return
+ if not d.startswith('channel:run:'):return
+ key=d.split(':',2)[2]
+ item=CHANNELS.get(key)
+ if not item:return
+ if not channel_downloader.available:
+  await q.message.reply_text('⚠️ La sesión no está vinculada.');return
+ if context.application.bot_data.get('channel_sync_running'):
+  await q.message.reply_text('⏳ Ya hay una sincronización en curso.');return
+ context.application.bot_data['channel_sync_running']=True
+ try:
+  await q.edit_message_text(f"🔎 Comprobando acceso a {item['name']}...")
+  entity=await channel_downloader.resolve_allowed(item)
+  await q.message.reply_text('🔎 Indexando canal en SQLite...')
+  e,n=await channel_downloader.scan_to_db(entity,item['destination'])
+  await q.message.reply_text(f'✅ {n:,} archivos indexados. Iniciando descarga...')
+  await process_channel(update,context,e,item['destination'])
+ except Exception as exc:
+  await q.message.reply_text(f'❌ No se pudo sincronizar el canal: {type(exc).__name__}. Comprueba el acceso y los logs.')
+ finally:
+  context.application.bot_data['channel_sync_running']=False
+
 async def receive_channel_reference(update,context):
- m=update.effective_message
- if not m or not m.text or not context.user_data.get('awaiting_channel') or not _authorized(update,context):return
- ref=m.text.strip();mode=context.user_data.get('channel_mode');context.user_data['awaiting_channel']=False
- status=await m.reply_text('🔎 Indexando canal en SQLite... 0 archivos')
- async def progress(n):
-  try:await status.edit_text(f'🔎 Indexando canal en SQLite... {n:,} archivos encontrados')
-  except Exception:pass
- try:e,n=await channel_downloader.scan_to_db(ref,mode,progress)
- except Exception as ex:await status.edit_text(f'❌ No se pudo leer el canal: {ex}');return
- counts=channel_db.counts(int(e.id));await status.edit_text(f"✅ Índice preparado: {counts['total']:,} archivos conocidos.\n🚀 Iniciando cola persistente por bloques de {CHANNEL_BATCH_SIZE}...")
- await process_channel(update,context,e,mode)
+ # No se admiten referencias libres; solo canales de CHANNELS.
+ return
+
 async def process_channel(update,context,e,mode):
  m=update.effective_message;uid=update.effective_user.id;cid=int(e.id);channel_db.reset_interrupted(cid);sem=asyncio.Semaphore(TG_MAX_PARALLEL)
  while True:
