@@ -28,7 +28,7 @@ class ChannelDownloader:
   return result.chat
  async def scan_to_db(self,ref,dest,progress=None):
   if not self._started:raise RuntimeError('La sesión de usuario para canales no está autorizada.')
-  e=await self.client.get_entity(ref.strip());cid=int(e.id);title=getattr(e,'title',None) or ref;channel_db.upsert_channel(cid,title,ref,dest);n=0
+  e=await self.client.get_entity(ref.strip() if isinstance(ref,str) else ref);cid=int(e.id);title=getattr(e,'title',None) or str(cid);channel_db.upsert_channel(cid,title,str(getattr(e,'id',ref)),dest);n=0
   async for m in self.client.iter_messages(e,reverse=True):
    if not m.file:continue
    channel_db.add_file(cid,m.id,Path(m.file.name or f'archivo_{m.id}').name,m.file.size or 0);n+=1

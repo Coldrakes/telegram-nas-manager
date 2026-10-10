@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, shutil
+import asyncio, shutil, logging
 from pathlib import Path
 from telegram import InlineKeyboardButton,InlineKeyboardMarkup,Update
 from telegram.ext import ContextTypes
@@ -13,6 +13,7 @@ def _authorized(u,c):return bool(u.effective_user and u.effective_user.id in c.b
 def _free_gb(p):return shutil.disk_usage(p).free/(1024**3)
 
 from services.allowed_channels import CHANNELS
+logger = logging.getLogger(__name__)
 
 async def channel_start(update:Update,context:ContextTypes.DEFAULT_TYPE):
  m=update.effective_message
@@ -48,6 +49,7 @@ async def channel_callback(update,context):
   await q.message.reply_text(f'✅ {n:,} archivos indexados. Iniciando descarga...')
   await process_channel(update,context,e,item['destination'])
  except Exception as exc:
+  logger.exception('Error sincronizando canal %s', key)
   await q.message.reply_text(f'❌ No se pudo sincronizar el canal: {type(exc).__name__}. Comprueba el acceso y los logs.')
  finally:
   context.application.bot_data['channel_sync_running']=False
