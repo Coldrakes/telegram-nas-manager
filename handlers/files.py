@@ -533,38 +533,9 @@ async def finish_batch(
         )
         return
 
-    extracting_text = (
-        f"📦 DESCARGAS COMPLETADAS\n\n"
-        f"✅ {state['completed']}/{total_files} archivos descargados.\n\n"
-        "🗜️ Comprobando y descomprimiendo archivos..."
-    )
-    recovered_id = await _smart_status_message(
-        context, query.message.chat_id, state.get("status_message_id"),
-        extracting_text,
-    )
-    if recovered_id is not None:
-        state["status_message_id"] = recovered_id
-
-    extraction = await extract_archives(temp_dir)
-    if extraction.errors:
-        error_text = "\n".join(f"• {error}" for error in extraction.errors)
-        await _edit_or_recover_message(
-            context, query.message.chat_id, state.get("status_message_id"),
-            (
-                "⚠️ ERROR DE DESCOMPRESIÓN\n\n"
-                f"🗜️ Grupos extraídos: {extraction.extracted_groups}\n"
-                f"❌ Errores: {len(extraction.errors)}\n\n"
-                f"{error_text}\n\n"
-                "Los comprimidos afectados se conservan en la carpeta temporal "
-                "y el lote NO se mueve al NAS."
-            ),
-        )
-        return
-
     organizing_text = (
-        f"🗜️ Descompresión completada: {extraction.extracted_groups} grupo(s).\n"
-        f"🗑️ Comprimidos eliminados: {extraction.deleted_archives}.\n\n"
-        f"💾 Organizando en {destination_name}..."
+        f"📦 Descargas completadas: {state['completed']}/{total_files}.\n"
+        f"💾 Moviendo archivos originales a {destination_name} (sin descomprimir)..."
     )
     recovered_id = await _smart_status_message(
         context, query.message.chat_id, state.get("status_message_id"),

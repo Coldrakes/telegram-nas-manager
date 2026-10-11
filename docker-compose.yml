@@ -16,7 +16,7 @@ services:
       TEMP_PATH: /data/temp
       TG_SESSION_PATH: /app/session/telegram_bot
       TG_PROGRESS_INTERVAL: ${TG_PROGRESS_INTERVAL:-30}
-      AUTO_EXTRACT: ${AUTO_EXTRACT:-True}
+      AUTO_EXTRACT: ${AUTO_EXTRACT:-False}
       DELETE_ARCHIVES_AFTER_EXTRACT: ${DELETE_ARCHIVES_AFTER_EXTRACT:-True}
       CHANNEL_SESSION_PATH: /app/session/telegram_user
       CHANNEL_DB_PATH: /app/data/coldnas.db

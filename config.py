@@ -113,7 +113,7 @@ TEMP_PATH = os.getenv(
 # DESCOMPRESIÓN / CANALES
 # ============================================================
 
-AUTO_EXTRACT = os.getenv("AUTO_EXTRACT", "True").lower() == "true"
+AUTO_EXTRACT = os.getenv("AUTO_EXTRACT", "False").lower() == "true"
 DELETE_ARCHIVES_AFTER_EXTRACT = os.getenv(
     "DELETE_ARCHIVES_AFTER_EXTRACT", "True"
 ).lower() == "true"

@@ -264,3 +264,14 @@ y escanea la imagen. El QR se renueva al caducar y se elimina al finalizar.
 Si Telegram solicita contraseña de verificación en dos pasos, el bot la recibe temporalmente
 por chat y trata de borrar el mensaje: no es un canal adecuado para credenciales en producción.
 No envíes códigos de inicio de sesión al bot. La sesión persistente se guarda según `CHANNEL_SESSION_PATH`.
+
+## Sincronización incremental (versión actual)
+
+- La lista de canales sigue fija en `services/allowed_channels.py`.
+- Se descarga **un archivo cada vez**, se copia al NAS con extensión `.incoming`, se verifica el tamaño y se publica con renombrado atómico. Solo después se marca `completed` en SQLite (`CHANNEL_DB_PATH`). No se descomprime ningún archivo, tampoco en lotes manuales.
+- El nombre de destino incorpora el ID de canal y mensaje para evitar colisiones y permitir recuperar un traslado terminado aunque se apague el equipo antes de confirmar SQLite.
+- Tras reiniciar, vuelve a **Sincronizar canal**. Se reindexa el canal (sin duplicar filas), se omiten los archivos `completed` y se reconcilian los archivos existentes antes de descargarlos otra vez. Las descargas parciales se reinician desde cero; no hay reanudación por bytes.
+- El progreso se muestra editando un único mensaje aproximadamente cada 5 segundos y al finalizar cada archivo. La copia al NAS se hace antes de contabilizar el archivo como completado.
+- Es imprescindible persistir `/app/data` (SQLite), `/app/session` (sesión Telegram), y las rutas de destino. No borres el archivo de base de datos entre despliegues.
+- **Descompresión desactivada**: elimina `AUTO_EXTRACT=True` de tu `.env` o establécelo en `False`; en esta versión los handlers no ejecutan extracción.
+- `TG_MAX_PARALLEL` se mantiene para las descargas manuales; la sincronización de canal es secuencial para priorizar durabilidad y un progreso claro.
