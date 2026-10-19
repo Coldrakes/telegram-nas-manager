@@ -1,152 +1,60 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as K
+from services.batch_db import batch_db as db
+from handlers.files import show, launch, title, authorized
 
-from services.storage import clear_temp_batch
+def home_markup():return K([[B('➕ Nuevo lote',callback_data='nav:new'),B('📋 Mis lotes',callback_data='nav:lots')],[B('📊 Actividad',callback_data='nav:activity'),B('⚙️ Ajustes',callback_data='nav:settings')]])
 
+async def start(update,context):
+    if not authorized(update,context):return
+    await update.message.reply_text('🤖 ColdNas Manager\n\nGestor de descargas al NAS',reply_markup=home_markup())
 
-def is_authorized(user_id: int, allowed_users: set[int]) -> bool:
-    return user_id in allowed_users
+async def create_mode(context,user,chat,mode):
+    existing=db.active(user)
+    if existing:return existing['id'],False
+    return db.create(user,chat,mode),True
 
+async def mode_callback(update,context):
+    q=update.callback_query
+    if not authorized(update,context):await q.answer('No autorizado',show_alert=True);return
+    mode=q.data.split(':')[1]
+    if mode not in ('movies','series','3d'):await q.answer('Modo inválido');return
+    bid,created=await create_mode(context,q.from_user.id,q.message.chat_id,mode)
+    await q.answer('Lote creado' if created else 'Ya tienes un lote abierto')
+    await show(context,bid,True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not update.message:
-        return
+async def command_mode(update,context,mode):
+    if not authorized(update,context):return
+    bid,_=await create_mode(context,update.effective_user.id,update.effective_chat.id,mode)
+    await show(context,bid,True)
 
-    if not is_authorized(user.id, context.bot_data["allowed_users"]):
-        await update.message.reply_text("⛔ No estás autorizado para utilizar este bot.")
-        return
+async def movies(u,c):await command_mode(u,c,'movies')
+async def series(u,c):await command_mode(u,c,'series')
+async def three_d(u,c):await command_mode(u,c,'3d')
+async def nuevo(u,c):
+    if authorized(u,c):await u.message.reply_text('Selecciona destino:',reply_markup=mode_markup())
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Descargar ficheros", callback_data="action:files")],
-        [InlineKeyboardButton("📡 Sincronizar canal", callback_data="channel:start")],
-        [InlineKeyboardButton("⚙️ Configuración", callback_data="session:menu")],
-    ])
+def mode_markup():return K([[B('🎬 Películas',callback_data='mode:movies'),B('📺 Series',callback_data='mode:series')],[B('🧊 3D',callback_data='mode:3d')],[B('🏠 Panel',callback_data='nav:home')]])
 
-    await update.message.reply_text(
-        "👋 Hola.\n\nSelecciona qué quieres hacer:",
-        reply_markup=keyboard,
-    )
-
-
-async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    user = query.from_user
-    if not is_authorized(user.id, context.bot_data["allowed_users"]):
-        await query.edit_message_text("⛔ No estás autorizado.")
-        return
-    if query.data != "action:files":
-        return
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎬 Películas", callback_data="mode:movies"),
-            InlineKeyboardButton("📺 Series", callback_data="mode:series"),
-        ],
-        [InlineKeyboardButton("🧊 3D", callback_data="mode:3d")],
-    ])
-    await query.edit_message_text(
-        "📥 DESCARGAR FICHEROS\n\nSelecciona dónde quieres guardar el lote:",
-        reply_markup=keyboard,
-    )
-
-
-async def series(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _command_mode(update, context, "series")
-
-
-async def movies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _command_mode(update, context, "movies")
-
-
-async def three_d(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _command_mode(update, context, "3d")
-
-
-async def _command_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
-    if not is_authorized(user.id, context.bot_data["allowed_users"]):
-        await update.message.reply_text("⛔ No estás autorizado.")
-        return
-
-    await activate_mode(update, context, mode)
-
-
-async def activate_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
-    clear_temp_batch(user.id)
-    context.user_data["mode"] = mode
-    context.user_data["files"] = {}
-    context.user_data["control_message_id"] = None
-
-    titles = {
-        "movies": "🎬 Modo PELÍCULAS activado",
-        "series": "📺 Modo SERIES activado",
-        "3d": "🧊 Modo 3D activado",
-    }
-
-    await update.message.reply_text(
-        f"{titles[mode]}\n\n"
-        "Envíame los archivos que quieras añadir al lote.\n\n"
-        "Los archivos NO se descargarán hasta que pulses «Finalizar lote»."
-    )
-
-
-async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-    user = query.from_user
-
-    if not is_authorized(user.id, context.bot_data["allowed_users"]):
-        await query.edit_message_text("⛔ No estás autorizado.")
-        return
-
-    mode = query.data.split(":", 1)[1]
-    if mode not in {"movies", "series", "3d"}:
-        await query.edit_message_text("⛔ Modo no válido.")
-        return
-
-    clear_temp_batch(user.id)
-    context.user_data["mode"] = mode
-    context.user_data["files"] = {}
-    context.user_data["control_message_id"] = None
-
-    titles = {
-        "movies": "🎬 Modo PELÍCULAS activado",
-        "series": "📺 Modo SERIES activado",
-        "3d": "🧊 Modo 3D activado",
-    }
-
-    await query.edit_message_text(
-        f"{titles[mode]}.\n\n"
-        "Envíame los archivos que quieras añadir al lote.\n\n"
-        "Los archivos NO se descargarán hasta que pulses «Finalizar lote»."
-    )
-
-
-async def cancel_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-    user = query.from_user
-
-    if not is_authorized(user.id, context.bot_data["allowed_users"]):
-        await query.edit_message_text("⛔ No estás autorizado.")
-        return
-
-    clear_temp_batch(user.id)
-    context.user_data.clear()
-    await query.edit_message_text("❌ Lote cancelado.")
+async def navigation(update,context):
+    q=update.callback_query
+    if not authorized(update,context):await q.answer('No autorizado',show_alert=True);return
+    await q.answer();action=q.data.split(':')[1]
+    if action=='home':
+        batches=db.list(q.from_user.id)
+        active=[b for b in batches if b['status'] not in ('done','cancelled')]
+        text=f'🤖 COLDNAS MANAGER\n\n📦 Lotes activos: {len(active)}\n'
+        text+='\n'.join(f"• #{b['id']} {title(b['mode'])}: {b['status']}" for b in active[:8])
+        await q.edit_message_text(text,reply_markup=home_markup())
+    elif action=='new':await q.edit_message_text('➕ Nuevo lote\nSelecciona destino:',reply_markup=mode_markup())
+    elif action=='lots':
+        batches=db.list(q.from_user.id)
+        rows=[[B(f"#{b['id']} {title(b['mode'])} · {b['status']}",callback_data=f"b:view:{b['id']}")] for b in batches[:15]]
+        rows.append([B('🏠 Panel',callback_data='nav:home')])
+        await q.edit_message_text('📋 Mis lotes',reply_markup=K(rows))
+    elif action=='activity':
+        batches=db.list(q.from_user.id)
+        text='📊 Actividad reciente\n\n'+'\n'.join(f"#{b['id']} {title(b['mode'])}: {b['status']}" for b in batches[:12])
+        await q.edit_message_text(text,reply_markup=K([[B('🏠 Panel',callback_data='nav:home')]]))
+    elif action=='settings':
+        from config import TG_PROGRESS_INTERVAL,TG_MAX_PARALLEL
+        await q.edit_message_text(f'⚙️ Configuración\n\nRefresco: {TG_PROGRESS_INTERVAL:.0f} s\nDescargas paralelas: {TG_MAX_PARALLEL}\nDescompresión: activada\nSobrescritura: siempre\nBorrar comprimidos tras verificar: sí\n\nCambiar refresco con TG_PROGRESS_INTERVAL=30 o 60 en .env y reiniciar.',reply_markup=K([[B('🏠 Panel',callback_data='nav:home')]]))

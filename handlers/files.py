@@ -1,576 +1,180 @@
-from __future__ import annotations
-
+"""Manual batches: persistent queue, progress panel, restart recovery."""
 import asyncio
+import logging
 import time
 from pathlib import Path
-
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
-from telegram.ext import ContextTypes
-
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as K
+from telegram.error import BadRequest, RetryAfter, NetworkError, TimedOut
 from config import TG_MAX_PARALLEL, TG_PROGRESS_INTERVAL
-from services.storage import (
-    get_temp_batch_dir,
-    move_batch_to_destination,
-)
-from services.telethon_downloader import telethon_downloader
+from services.batch_db import batch_db as db
+from services.storage import get_temp_batch_dir, move_batch_to_destination
 from services.archive_manager import extract_archives
+from services.telethon_downloader import telethon_downloader
 
+log=logging.getLogger(__name__)
+RUNNING={}
+PAUSED=set()
 
-def _safe_filename(filename: str) -> str:
-    name = Path(filename).name.strip()
-    return name if name and name not in {".", ".."} else "archivo"
+def authorized(update,context):
+    return bool(update.effective_user and update.effective_user.id in context.bot_data['allowed_users'])
 
+def title(mode):return {'movies':'🎬 Películas','series':'📺 Series','3d':'🧊 3D'}.get(mode,mode)
 
-async def receive_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.message
-    if not message:
-        return
+def kb(bid,status):
+    rows=[]
+    if status=='open':rows.append([B('✅ Cerrar y descargar',callback_data=f'b:finish:{bid}'),B('❌ Cancelar',callback_data=f'b:cancel:{bid}')])
+    elif status in ('queued','downloading','paused'):
+        rows.append([B('▶️ Reanudar' if status=='paused' else '⏸ Pausar',callback_data=f'b:toggle:{bid}'),B('📄 Archivos',callback_data=f'b:files:{bid}:0:all')])
+    else:rows.append([B('📄 Archivos',callback_data=f'b:files:{bid}:0:all')])
+    rows.append([B('🏠 Panel',callback_data='nav:home'),B('📋 Mis lotes',callback_data='nav:lots')])
+    return K(rows)
 
-    user = update.effective_user
-    if not user:
-        return
+def status_text(batch,active=None):
+    items=db.items(batch['id']);done=sum(i['status']=='done' for i in items);fail=sum(i['status']=='error' for i in items)
+    total=len(items);bytes_done=sum(i['size'] for i in items if i['status']=='done');size=sum(i['size'] for i in items)
+    icons={'open':'📝 Preparando','queued':'⏳ En cola','downloading':'⬇️ Descargando','paused':'⏸ Pausado','extracting':'📦 Descomprimiendo','organizing':'💾 Guardando en NAS','done':'✅ Completado','error':'⚠️ Con errores','cancelled':'❌ Cancelado'}
+    lines=[f"{title(batch['mode'])} · Lote #{batch['id']}",f"{icons.get(batch['status'],batch['status'])}",'',f'📦 {done}/{total} archivos · {fail} errores',f'💾 {bytes_done/1073741824:.2f}/{size/1073741824:.2f} GB',f'🔄 Paralelas: {TG_MAX_PARALLEL}']
+    if active:
+        lines.append('');lines.append('Descargas activas:')
+        for name,(cur,total_bytes) in list(active.items())[:TG_MAX_PARALLEL]:
+            pct=100*cur/total_bytes if total_bytes else 0
+            lines.append(f'• {name[:65]}: {pct:.1f}%')
+    if batch['status']=='open':lines.extend(['','Envía archivos y pulsa «Cerrar y descargar».'])
+    if fail:lines.extend(['','Consulta «Archivos» para ver los errores.'])
+    return '\n'.join(lines)[:3900]
 
-    context.user_data["last_user_message_id"] = message.message_id
-
-    if user.id not in context.bot_data["allowed_users"]:
-        await message.reply_text("⛔ No estás autorizado.")
-        return
-
-    mode = context.user_data.get("mode")
-    if not mode:
-        await message.reply_text(
-            "ℹ️ Primero selecciona un modo con /series, /peliculas o /3d."
-        )
-        return
-
-    document = message.document
-    if not document:
-        return
-
-    filename = _safe_filename(
-        document.file_name or f"archivo_{message.message_id}"
-    )
-
-    files = context.user_data.setdefault("files", {})
-
-    files[filename] = {
-        "chat_id": message.chat_id,
-        "message_id": message.message_id,
-        "filename": filename,
-        "size": document.file_size or 0,
-    }
-
-    await update_control_message(message, context)
-
-
-def _retry_after_seconds(error: RetryAfter) -> float:
-    value = error.retry_after
-    if hasattr(value, "total_seconds"):
-        return max(1.0, float(value.total_seconds()))
-    return max(1.0, float(value))
-
-
-def _set_flood_wait(context, error: RetryAfter) -> float:
-    seconds = _retry_after_seconds(error)
-    # Añadimos un pequeño margen para no golpear Telegram justo al vencer el límite.
-    until = time.monotonic() + seconds + 1.0
-    current = float(context.bot_data.get("telegram_flood_until", 0.0))
-    context.bot_data["telegram_flood_until"] = max(current, until)
-    print(f"⚠️ Telegram FloodWait: pausando actualizaciones UI {seconds:.0f} s.")
-    return seconds
-
-
-def _ui_flooded(context) -> bool:
-    return time.monotonic() < float(
-        context.bot_data.get("telegram_flood_until", 0.0)
-    )
-
-
-async def _send_control_message(context, chat_id: int, text: str, reply_markup=None):
-    """Crea un mensaje de control. Un timeout no se considera prueba de fallo."""
+async def show(context,bid,force=False,active=None):
+    batch=db.get(bid)
+    if not batch:return
+    last=context.application.bot_data.setdefault('last_ui',{})
+    if not force and time.monotonic()-last.get(bid,0)<TG_PROGRESS_INTERVAL:return
+    last[bid]=time.monotonic()
+    text=status_text(batch,active)
     try:
-        return await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-    except RetryAfter as error:
-        _set_flood_wait(context, error)
-        return None
-    except (TimedOut, NetworkError) as error:
-        print(f"⚠️ Telegram no respondió al crear el mensaje de control: {error}")
-        return None
-
-
-async def _edit_or_recover_message(
-    context,
-    chat_id: int,
-    message_id: int | None,
-    text: str,
-    reply_markup=None,
-) -> int | None:
-    """
-    Intenta editar el mensaje de control.
-
-    - TimedOut/NetworkError: no crea otro mensaje porque Telegram podría haber
-      procesado la edición aunque no recibamos la respuesta.
-    - BadRequest indicando que el mensaje ya no puede editarse/no existe:
-      crea un mensaje nuevo y devuelve su ID.
-    """
-    # Si Telegram ya nos pidió esperar, no hacemos ninguna llamada UI hasta
-    # que venza RetryAfter. Las descargas continúan independientemente.
-    if _ui_flooded(context):
-        return message_id
-
-    if message_id is None:
-        created = await _send_control_message(
-            context, chat_id, text, reply_markup
-        )
-        return created.message_id if created else None
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        return message_id
-
-    except RetryAfter as error:
-        _set_flood_wait(context, error)
-        return message_id
-
-    except BadRequest as error:
-        description = str(error).lower()
-
-        # No es un fallo real: Telegram devuelve esto si el contenido ya coincide.
-        if "message is not modified" in description:
-            return message_id
-
-        # Para otros BadRequest el mensaje de control puede haber sido borrado,
-        # ser inaccesible o haber dejado de ser editable. Creamos uno nuevo.
-        print(
-            f"⚠️ No se pudo editar el mensaje {message_id}: {error}. "
-            "Creando uno nuevo."
-        )
-        created = await _send_control_message(
-            context, chat_id, text, reply_markup
-        )
-        return created.message_id if created else message_id
-
-    except (TimedOut, NetworkError) as error:
-        # MUY IMPORTANTE: no crear otro mensaje aquí. Con un timeout no sabemos
-        # si Telegram llegó a procesar la petición y podríamos duplicar mensajes.
-        print(
-            f"⚠️ Error temporal actualizando mensaje {message_id}: {error}. "
-            "Se reintentará en la siguiente actualización."
-        )
-        return message_id
-
-
-async def _replace_status_message(
-    context,
-    chat_id: int,
-    old_message_id: int | None,
-    text: str,
-    reply_markup=None,
-) -> int | None:
-    """Publica el estado como mensaje nuevo para mantenerlo al final del chat.
-
-    Primero crea el nuevo mensaje y solo después intenta borrar el anterior. Si
-    Telegram está en FloodWait o hay un error temporal, se conserva el mensaje
-    anterior y la descarga/lote continúa sin verse afectado.
-    """
-    if _ui_flooded(context):
-        return old_message_id
-
-    created = await _send_control_message(context, chat_id, text, reply_markup)
-    if created is None:
-        return old_message_id
-
-    new_id = created.message_id
-
-    if old_message_id and old_message_id != new_id:
+        if batch['message_id']:
+            await context.bot.edit_message_text(chat_id=batch['chat_id'],message_id=batch['message_id'],text=text,reply_markup=kb(bid,batch['status']))
+        else:
+            msg=await context.bot.send_message(batch['chat_id'],text,reply_markup=kb(bid,batch['status']))
+            db.message(bid,msg.message_id)
+    except BadRequest as e:
+        if 'not modified' in str(e).lower():return
+        log.warning('Panel not editable: %s',e)
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=old_message_id)
-        except RetryAfter as error:
-            _set_flood_wait(context, error)
-        except BadRequest as error:
-            # Si ya fue borrado, no hay nada que hacer.
-            description = str(error).lower()
-            if "message to delete not found" not in description and "message can't be deleted" not in description:
-                print(f"⚠️ No se pudo borrar el mensaje anterior {old_message_id}: {error}")
-        except (TimedOut, NetworkError) as error:
-            print(f"⚠️ Error temporal borrando el mensaje anterior {old_message_id}: {error}")
+            msg=await context.bot.send_message(batch['chat_id'],text,reply_markup=kb(bid,batch['status']))
+            db.message(bid,msg.message_id)
+        except Exception:log.exception('Could not replace panel')
+    except (TimedOut,NetworkError,RetryAfter):log.warning('Transient Telegram UI failure; will retry')
 
-    return new_id
-
-
-async def track_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recuerda el último mensaje entrante para saber si el estado sigue abajo."""
-    message = update.effective_message
-    if message:
-        context.user_data["last_user_message_id"] = message.message_id
-
-
-async def _smart_status_message(
-    context, chat_id: int, message_id: int | None, text: str, reply_markup=None
-) -> int | None:
-    """Edita mientras el estado siga siendo el último; si quedó arriba, lo recoloca."""
-    last_user_id = int(context.user_data.get("last_user_message_id", 0) or 0)
-    if message_id is None or last_user_id > message_id:
-        return await _replace_status_message(
-            context, chat_id, message_id, text, reply_markup
-        )
-    return await _edit_or_recover_message(
-        context, chat_id, message_id, text, reply_markup
-    )
-
-
-async def update_control_message(message, context):
-    files = context.user_data.get("files", {})
-    mode = context.user_data.get("mode")
-
-    title = {
-        "series": "📺 SERIES",
-        "movies": "🎬 PELÍCULAS",
-        "3d": "🧊 3D",
-    }.get(mode, "📦 LOTE")
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Finalizar lote",
-                callback_data="batch:finish",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ Cancelar",
-                callback_data="batch:cancel",
-            )
-        ],
-    ])
-
-    text = (
-        f"{title}\n\n"
-        f"📦 Archivos en cola: {len(files)}\n\n"
-        "Los archivos están en espera.\n"
-        "⚠️ Todavía NO se están descargando.\n\n"
-        "Puedes seguir enviando archivos o pulsar "
-        "«Finalizar lote»."
-    )
-
-    control_id = context.user_data.get("control_message_id")
-    new_id = await _smart_status_message(
-        context=context,
-        chat_id=message.chat_id,
-        message_id=control_id,
-        text=text,
-        reply_markup=keyboard,
-    )
-
-    if new_id is not None:
-        context.user_data["control_message_id"] = new_id
-
-
-def _format_mb(value: int) -> str:
-    return f"{value / (1024 * 1024):.1f} MB"
-
-
-def _bar(percentage: float, length: int = 18) -> str:
-    percentage = max(0.0, min(100.0, percentage))
-    filled = round(length * percentage / 100)
-    return "█" * filled + "░" * (length - filled)
-
-
-async def _progress_loop(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    state: dict,
-    stop_event: asyncio.Event,
-):
-    """Publica el progreso cada TG_PROGRESS_INTERVAL segundos.
-
-    Cada actualización crea un mensaje nuevo y después elimina el anterior para
-    que el estado quede entre los mensajes más recientes. RetryAfter, timeouts y
-    errores de red afectan solo a la UI; Telethon sigue descargando.
-    """
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=TG_PROGRESS_INTERVAL,
-            )
-            break
-        except asyncio.TimeoutError:
-            pass
-
-        if _ui_flooded(context):
-            continue
-
-        text = _build_status_text(state)
-        new_id = await _smart_status_message(
-            context=context,
-            chat_id=chat_id,
-            message_id=state.get("status_message_id"),
-            text=text,
-        )
-        if new_id is not None:
-            state["status_message_id"] = new_id
-
-
-def _build_status_text(state: dict) -> str:
-    total = state["total"]
-    completed = state["completed"]
-    failed = state["failed"]
-    active = state["active"]
-    queued = max(0, total - completed - failed - len(active))
-
-    lines = [
-        "🚀 DESCARGANDO LOTE",
-        "",
-        f"📦 Progreso: {completed + failed}/{total}",
-        f"🔄 Descargas activas: {len(active)}/{TG_MAX_PARALLEL}",
-        f"⏳ En cola: {queued}",
-        "",
-    ]
-
-    if not active:
-        lines.append("⏳ Preparando descargas...")
-        return "\n".join(lines)
-
-    for item in list(active.values())[:TG_MAX_PARALLEL]:
-        current = item["current"]
-        total_bytes = item["total"]
-        percentage = (
-            current * 100 / total_bytes
-            if total_bytes
-            else 0
-        )
-
-        lines.extend([
-            f"📄 {item['filename']}",
-            f"{_bar(percentage)} {percentage:.1f}%",
-            f"{_format_mb(current)} / {_format_mb(total_bytes)}",
-            "",
-        ])
-
-    if len(lines) > 18:
-        lines = lines[:18]
-
-    return "\n".join(lines).rstrip()
-
-
-async def finish_batch(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    if not query:
+async def receive_file(update,context):
+    if not authorized(update,context):return
+    msg=update.message
+    if not msg or not msg.document:return
+    batch=db.active(update.effective_user.id)
+    if not batch:
+        await msg.reply_text('Primero crea un lote con /nuevo, /series, /peliculas o /3d.')
         return
+    name=Path(msg.document.file_name or f'archivo_{msg.message_id}').name
+    if name in ('.','..'):return
+    db.add(batch['id'],msg.chat_id,msg.message_id,name,msg.document.file_size or 0)
+    await show(context,batch['id'],force=True)
 
+async def run_batch(application,bid):
+    if bid in RUNNING:return
+    batch=db.get(bid)
+    if not batch or batch['status'] not in ('queued','downloading','organizing','extracting'):return
+    RUNNING[bid]=asyncio.current_task()
+    class C:pass
+    context=C();context.bot=application.bot;context.application=application
+    active={};temp=get_temp_batch_dir(bid)
     try:
-        await query.answer()
-    except RetryAfter as error:
-        _set_flood_wait(context, error)
-    except (TimedOut, NetworkError) as error:
-        print(f"⚠️ Timeout respondiendo al botón: {error}")
+        db.batch_status(bid,'downloading');await show(context,bid,True)
+        sem=asyncio.Semaphore(TG_MAX_PARALLEL)
+        async def one(item):
+            async with sem:
+                while bid in PAUSED:await asyncio.sleep(1)
+                dest=temp/item['filename']
+                if item['status']=='done' and dest.is_file() and dest.stat().st_size==item['size']:return
+                if dest.exists() and dest.stat().st_size==item['size'] and item['size']>0:
+                    db.item_status(item['id'],'done');return
+                db.item_status(item['id'],'downloading')
+                async def progress(current,total):
+                    active[item['filename']]=(current,total)
+                try:
+                    # Telethon download_media doesn't guarantee byte-level resume.
+                    # An interrupted file restarts, but completed files are reused.
+                    if dest.exists():dest.unlink()
+                    await telethon_downloader.download_message(item['chat_id'],item['message_id'],dest,progress)
+                    if not dest.is_file() or (item['size'] and dest.stat().st_size!=item['size']):
+                        raise RuntimeError('Tamaño descargado incorrecto')
+                    db.item_status(item['id'],'done')
+                except asyncio.CancelledError:
+                    db.item_status(item['id'],'pending');raise
+                except Exception as exc:
+                    db.item_status(item['id'],'error',str(exc)[:500]);log.exception('Download failed: %s',item['filename'])
+                finally:active.pop(item['filename'],None)
+        jobs=[asyncio.create_task(one(i)) for i in db.items(bid) if i['status']!='done' or not (temp/i['filename']).is_file()]
+        while any(not j.done() for j in jobs):
+            await show(context,bid,active=active)
+            await asyncio.sleep(2)
+        if jobs:await asyncio.gather(*jobs)
+        if any(i['status']=='error' for i in db.items(bid)):
+            db.batch_status(bid,'error');await show(context,bid,True);return
+        db.batch_status(bid,'extracting');await show(context,bid,True)
+        report=await extract_archives(temp)
+        if report.errors:
+            db.batch_status(bid,'error')
+            log.error('Extraction errors for batch %s: %s',bid,report.errors)
+            await show(context,bid,True);return
+        db.batch_status(bid,'organizing');await show(context,bid,True)
+        moved,errors=move_batch_to_destination(bid,batch['mode'])
+        db.batch_status(bid,'error' if errors else 'done')
+        if errors:log.error('Move errors batch %s: %s',bid,errors)
+        await show(context,bid,True)
+    except asyncio.CancelledError:
+        db.batch_status(bid,'queued');raise
+    except Exception:
+        log.exception('Batch %s interrupted',bid)
+        db.batch_status(bid,'queued')
+    finally:RUNNING.pop(bid,None)
 
-    user = query.from_user
+def launch(application,bid):
+    if bid not in RUNNING:application.create_task(run_batch(application,bid))
 
-    if user.id not in context.bot_data["allowed_users"]:
-        await query.edit_message_text("⛔ No estás autorizado.")
-        return
+async def batch_callback(update,context):
+    q=update.callback_query
+    if not authorized(update,context):await q.answer('No autorizado',show_alert=True);return
+    _,action,id_str,*rest=q.data.split(':');bid=int(id_str);batch=db.get(bid)
+    if not batch or batch['user_id']!=q.from_user.id:await q.answer('Lote no encontrado',show_alert=True);return
+    await q.answer()
+    if action=='finish' and batch['status']=='open':
+        if not db.items(bid):await q.answer('Lote vacío',show_alert=True);return
+        db.batch_status(bid,'queued');launch(context.application,bid)
+    elif action=='cancel' and batch['status']=='open':db.batch_status(bid,'cancelled')
+    elif action=='toggle':
+        if bid in PAUSED or batch['status']=='paused':
+            PAUSED.discard(bid);db.batch_status(bid,'downloading');launch(context.application,bid)
+        else:
+            PAUSED.add(bid);db.batch_status(bid,'paused')
+    elif action=='files':
+        page=int(rest[0]) if rest else 0;filt=rest[1] if len(rest)>1 else 'all'
+        items=[i for i in db.items(bid) if filt=='all' or i['status']==filt];start=page*10
+        lines=[f'📄 Lote #{bid} · Archivos ({len(items)})','']
+        for i in items[start:start+10]:lines.append(f"{'✅' if i['status']=='done' else '❌' if i['status']=='error' else '⏳'} {i['filename'][:75]}"+(f"\n   {i['error'][:120]}" if i['error'] else ''))
+        rows=[[B('Todos',callback_data=f'b:files:{bid}:0:all'),B('Errores',callback_data=f'b:files:{bid}:0:error')]]
+        paging=[]
+        if page:paging.append(B('⬅️',callback_data=f'b:files:{bid}:{page-1}:{filt}'))
+        if start+10<len(items):paging.append(B('➡️',callback_data=f'b:files:{bid}:{page+1}:{filt}'))
+        if paging:rows.append(paging)
+        rows.append([B('↩️ Volver al lote',callback_data=f'b:view:{bid}')])
+        await q.edit_message_text('\n'.join(lines)[:3900],reply_markup=K(rows));return
+    elif action=='view':
+        await q.edit_message_text(status_text(db.get(bid)),reply_markup=kb(bid,db.get(bid)['status']));return
+    await show(context,bid,True)
 
-    mode = context.user_data.get("mode")
-    files = context.user_data.get("files", {})
+async def finish_batch(update,context):
+    batch=db.active(update.effective_user.id)
+    if not batch:return
+    update.callback_query.data=f'b:finish:{batch["id"]}'
+    await batch_callback(update,context)
 
-    if not mode:
-        await query.edit_message_text("ℹ️ No hay ningún lote activo.")
-        return
-
-    if not files:
-        await query.edit_message_text("ℹ️ El lote está vacío.")
-        return
-
-    temp_dir = get_temp_batch_dir(user.id)
-    total_files = len(files)
-    destination_name = {
-        "series": "Series",
-        "movies": "Películas",
-        "3d": "3D",
-    }.get(mode, mode)
-
-    state = {
-        "total": total_files,
-        "completed": 0,
-        "failed": 0,
-        "active": {},
-        "status_message_id": query.message.message_id,
-    }
-
-    initial_text = (
-        "🚀 DESCARGANDO LOTE\n\n"
-        f"📦 Progreso: 0/{total_files}\n"
-        f"🔄 Descargas activas: 0/{TG_MAX_PARALLEL}\n"
-        f"⏳ En cola: {total_files}"
-    )
-    recovered_id = await _smart_status_message(
-        context=context,
-        chat_id=query.message.chat_id,
-        message_id=state["status_message_id"],
-        text=initial_text,
-    )
-    if recovered_id is not None:
-        state["status_message_id"] = recovered_id
-
-    stop_event = asyncio.Event()
-
-    progress_task = asyncio.create_task(
-        _progress_loop(
-            context,
-            query.message.chat_id,
-            state,
-            stop_event,
-        )
-    )
-
-    semaphore = asyncio.Semaphore(TG_MAX_PARALLEL)
-    errors: list[str] = []
-
-    async def download_one(item: dict):
-        filename = item["filename"]
-
-        async with semaphore:
-            destination = (temp_dir / filename).resolve()
-
-            if temp_dir.resolve() not in destination.parents:
-                state["failed"] += 1
-                errors.append(
-                    f"{filename}: nombre de archivo no válido"
-                )
-                return
-
-            state["active"][filename] = {
-                "filename": filename,
-                "current": 0,
-                "total": item.get("size", 0),
-            }
-
-            async def progress_callback(current: int, total: int):
-                if filename not in state["active"]:
-                    return
-
-                state["active"][filename]["current"] = current
-                state["active"][filename]["total"] = total
-
-            try:
-                await telethon_downloader.download_message(
-                    chat_id=item["chat_id"],
-                    message_id=item["message_id"],
-                    destination=destination,
-                    progress_callback=progress_callback,
-                )
-
-                if not destination.exists():
-                    raise RuntimeError(
-                        "La descarga terminó pero el archivo no existe."
-                    )
-
-                state["completed"] += 1
-
-            except Exception as error:
-                state["failed"] += 1
-                errors.append(f"{filename}: {error}")
-
-                if destination.exists():
-                    try:
-                        destination.unlink()
-                    except Exception:
-                        pass
-
-            finally:
-                state["active"].pop(filename, None)
-
-    try:
-        await asyncio.gather(
-            *(download_one(item) for item in files.values())
-        )
-    finally:
-        stop_event.set()
-        try:
-            await progress_task
-        except Exception as error:
-            # La UI nunca debe convertir una descarga correcta en un fallo.
-            print(f"⚠️ Error no crítico en la tarea de progreso: {error}")
-
-    if errors:
-        error_text = "\n".join(
-            f"• {error}" for error in errors
-        )
-
-        final_error_text = (
-            f"⚠️ Lote descargado con errores.\n\n"
-            f"✅ Descargados: {state['completed']}/{total_files}\n"
-            f"❌ Errores: {len(errors)}\n\n"
-            f"{error_text}\n\n"
-            "Los archivos descargados permanecen en la carpeta temporal "
-            "y NO se han movido al NAS."
-        )
-        await _edit_or_recover_message(
-            context, query.message.chat_id, state.get("status_message_id"),
-            final_error_text,
-        )
-        return
-
-    organizing_text = (
-        f"📦 Descargas completadas: {state['completed']}/{total_files}.\n"
-        f"💾 Moviendo archivos originales a {destination_name} (sin descomprimir)..."
-    )
-    recovered_id = await _smart_status_message(
-        context, query.message.chat_id, state.get("status_message_id"),
-        organizing_text,
-    )
-    if recovered_id is not None:
-        state["status_message_id"] = recovered_id
-
-    moved, move_errors = move_batch_to_destination(
-        user.id,
-        mode,
-    )
-
-    if move_errors:
-        error_text = "\n".join(
-            f"• {error}" for error in move_errors
-        )
-
-        await _edit_or_recover_message(
-            context, query.message.chat_id, state.get("status_message_id"),
-            (
-                f"⚠️ LOTE PROCESADO CON ERRORES\n\n"
-                f"✅ Archivos guardados: {moved}\n"
-                f"❌ Errores: {len(move_errors)}\n\n"
-                f"{error_text}"
-            ),
-        )
-    else:
-        await _edit_or_recover_message(
-            context, query.message.chat_id, state.get("status_message_id"),
-            (
-                f"🎉 LOTE COMPLETADO\n\n"
-                f"📦 {moved} archivos\n"
-                f"📁 {destination_name}\n\n"
-                "✅ Todo guardado correctamente."
-            ),
-        )
-        context.user_data.clear()
+async def track_user_message(update,context):pass

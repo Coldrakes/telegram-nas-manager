@@ -22,13 +22,13 @@ def prepare_directories():
 
 
 def get_temp_batch_dir(user_id: int) -> Path:
-    path = TEMP_DIR / str(user_id)
+    path = TEMP_DIR / f"batch_{user_id}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def clear_temp_batch(user_id: int):
-    path = TEMP_DIR / str(user_id)
+    path = TEMP_DIR / f"batch_{user_id}"
     if path.exists():
         shutil.rmtree(path)
 
@@ -67,7 +67,23 @@ def move_batch_to_destination(user_id: int, mode: str) -> tuple[int, list[str]]:
             # Los archivos sueltos mantienen la organización Series/3D existente.
             target_dir = destination_dir if source.is_dir() else _get_file_destination(destination_dir, mode, source.name)
             target_dir.mkdir(parents=True, exist_ok=True)
-            destination = get_unique_filename(target_dir, source.name)
+            destination = target_dir / source.name
+            if destination.exists():
+                if destination.is_dir() and source.is_dir():
+                    for child in source.iterdir():
+                        target_child = destination / child.name
+                        if target_child.is_dir():
+                            shutil.rmtree(target_child)
+                        elif target_child.exists():
+                            target_child.unlink()
+                        shutil.move(str(child), str(target_child))
+                    source.rmdir()
+                    moved += 1
+                    continue
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
             shutil.move(str(source), str(destination))
             moved += 1
         except Exception as error:
