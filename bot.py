@@ -9,13 +9,14 @@ import sqlite3
 from datetime import datetime, time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
+from html import escape
 from zoneinfo import ZoneInfo
 
 import qbittorrentapi
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 load_dotenv()
@@ -40,6 +41,7 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)')
     c.execute('CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, title TEXT, kind TEXT, url TEXT, torrent_url TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS selections (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
+    c.execute('CREATE TABLE IF NOT EXISTS downloaded (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
     return c
 
 
@@ -68,10 +70,9 @@ def kind_from(text, href, context=''):
 
 
 def parse_latest():
+    """Read the current /ultimos page, retaining only movie release links."""
     soup = get_html(SOURCE)
-    found = []
-    seen = set()
-    # The site can change markup. Collect links to release detail pages, not navigation.
+    found, seen = [], set()
     for a in soup.select('a[href]'):
         href = urljoin(SOURCE, a.get('href', ''))
         p = urlparse(href)
@@ -83,17 +84,85 @@ def parse_latest():
         context = parent.get_text(' ', strip=True)[:250] if parent else ''
         title = a.get_text(' ', strip=True) or (a.find('img').get('alt', '') if a.find('img') else '')
         kind = kind_from(title, href, context)
-        if not kind or len(title) < 4 or len(title) > 180:
+        if kind != 'movies' or len(title) < 4 or len(title) > 180:
             continue
-        # Avoid category/menu links and prioritize actual release entries.
         if p.path.rstrip('/').lower() in ('/series', '/peliculas', '/peliculas-estrenos', '/ultimos'):
             continue
         seen.add(href)
-        found.append({'id': hashlib.sha256(href.encode()).hexdigest()[:16], 'title': title, 'kind': kind, 'url': href})
+        found.append({'id': hashlib.sha256(href.encode()).hexdigest()[:16], 'title': title, 'kind': 'movies', 'url': href})
         if len(found) >= MAX_ITEMS:
             break
     return found
 
+
+def text_of(soup, selectors):
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if node:
+            value = node.get('content', '') if node.name == 'meta' else node.get_text(' ', strip=True)
+            if value:
+                return value.strip()
+    return ''
+
+
+def detail(item):
+    soup = get_html(item['url'])
+    title = text_of(soup, ['h1', 'meta[property="og:title"]']) or item['title']
+    desc = text_of(soup, ['.sinopsis', '.synopsis', '.descripcion', '.description', '[itemprop="description"]', 'meta[name="description"]', 'meta[property="og:description"]'])
+    genres = text_of(soup, ['.generos', '.genres', '.genre', '[itemprop="genre"]'])
+    quality = text_of(soup, ['.calidad', '.quality', '.formato', '.format'])
+    if not quality:
+        m = re.search(r'\b(2160p|1080p|720p|4k|bluray|web[- .]?dl|hdtv|remux)\b', item['title'], re.I)
+        quality = m.group(0) if m else ''
+    image = ''
+    for selector in ['meta[property="og:image"]', '.poster img', '.cover img', '.caratula img', 'article img', 'main img']:
+        node = soup.select_one(selector)
+        if node:
+            raw = node.get('content') or node.get('data-src') or node.get('src')
+            if raw:
+                candidate = urljoin(item['url'], raw)
+                if urlparse(candidate).scheme == 'https' and urlparse(candidate).hostname == DOMAIN:
+                    image = candidate
+                    break
+    return {'title': title, 'description': desc, 'genres': genres, 'quality': quality, 'image': image}
+
+
+def caption(item, info):
+    lines = [f'<b>🎬 {escape(info["title"][:180])}</b>']
+    if info['genres']:
+        lines.append('🎭 <b>Géneros:</b> ' + escape(info['genres'][:180]))
+    if info['quality']:
+        lines.append('🎞 <b>Formato:</b> ' + escape(info['quality'][:120]))
+    if info['description']:
+        lines.append('\n📖 ' + escape(info['description'][:550]))
+    lines.append('\n<a href="' + escape(item['url'], quote=True) + '">Ver ficha en DonTorrent</a>')
+    return '\n'.join(lines)[:1000]
+
+
+def keyboard(item, downloaded=False):
+    return InlineKeyboardMarkup([[InlineKeyboardButton('✅ Añadida a qBittorrent' if downloaded else '📥 Descargar', callback_data='done' if downloaded else 'get:' + item['id'])]])
+
+
+async def send_card(app, chat_id, item):
+    try:
+        info = await asyncio.to_thread(detail, item)
+    except Exception:
+        LOG.exception('No se pudo leer la ficha %s', item['url'])
+        info = {'title': item['title'], 'description': '', 'genres': '', 'quality': '', 'image': ''}
+    with conn() as c:
+        done = bool(c.execute('SELECT 1 FROM downloaded WHERE chat_id=? AND id=?', (chat_id, item['id'])).fetchone())
+    body = caption(item, info)
+    if info['image']:
+        try:
+            r = await asyncio.to_thread(lambda: SESSION.get(safe_url(info['image']), timeout=20, allow_redirects=False))
+            r.raise_for_status()
+            if r.headers.get('content-type', '').lower().startswith('image/') and len(r.content) < 9_000_000:
+                import io
+                await app.bot.send_photo(chat_id, photo=io.BytesIO(r.content), caption=body, parse_mode='HTML', reply_markup=keyboard(item, done))
+                return
+        except Exception:
+            LOG.warning('No se pudo enviar portada %s', info['image'], exc_info=True)
+    await app.bot.send_message(chat_id, body, parse_mode='HTML', reply_markup=keyboard(item, done), disable_web_page_preview=True)
 
 def refresh():
     items = parse_latest()
@@ -180,37 +249,24 @@ def view(chat_id, kind='all', page=0):
 
 async def digest(app, chat_id, refresh_first=True):
     try:
-        items = await asyncio.to_thread(refresh) if refresh_first else None
-        if items is not None and not items:
-            await app.bot.send_message(chat_id, 'No se han podido identificar novedades en /ultimos. Puede haber cambiado el HTML; no se enviarán títulos inventados.')
+        items = await asyncio.to_thread(refresh) if refresh_first else parse_latest()
+        if not items:
+            await app.bot.send_message(chat_id, 'No se han identificado películas en /ultimos. Comprueba si ha cambiado el HTML.')
             return
-        with conn() as c:
-            rows = c.execute('SELECT title,kind FROM items ORDER BY rowid DESC LIMIT ?', (MAX_ITEMS,)).fetchall()
-        movies = [r[0] for r in rows if r[1] == 'movies']
-        series = [r[0] for r in rows if r[1] == 'tv']
-        # Telegram message length limit; split long digests.
-        for heading, titles in [('🎬 PELÍCULAS', movies), ('📺 SERIES', series)]:
-            lines = [heading] + [f'• {x}' for x in titles]
-            chunk = ''
-            for line in lines:
-                if len(chunk) + len(line) + 1 > 3500:
-                    await app.bot.send_message(chat_id, chunk)
-                    chunk = ''
-                chunk += line + '\n'
-            await app.bot.send_message(chat_id, chunk or heading + '\nSin resultados detectados')
-        message, markup = view(chat_id)
-        await app.bot.send_message(chat_id, message, reply_markup=markup)
+        await app.bot.send_message(chat_id, f'🎬 Novedades de películas: {len(items)} fichas. Pulsa Descargar en las que quieras añadir a qBittorrent.')
+        for item in items:
+            await send_card(app, chat_id, item)
+            await asyncio.sleep(0.12)
     except Exception as exc:
         LOG.exception('Error al consultar novedades')
         await app.bot.send_message(chat_id, f'Error al consultar novedades: {str(exc)[:300]}')
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not permitted(update):
         return await deny(update)
     with conn() as c:
         c.execute('INSERT OR IGNORE INTO chats(chat_id) VALUES(?)', (update.effective_chat.id,))
-    await update.message.reply_text('Bot activado. Recibirás todas las novedades cada día a las 07:00 (Europe/Madrid). Usa /novedades para consultarlas ahora.')
+    await update.message.reply_text('Bot activado. Recibirás las fichas de películas cada día a las 07:00 (Europe/Madrid). Usa /novedades para consultarlas ahora.')
 
 
 async def novedades(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,57 +279,39 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not permitted(update):
         return await deny(update)
     q = update.callback_query
-    await q.answer()
-    data = q.data
-    chat = q.message.chat_id
-    if data == 'noop':
+    if q.data == 'done':
+        await q.answer('Ya se añadió desde este chat.')
         return
-    if data == 'download':
+    if not q.data.startswith('get:'):
+        await q.answer('Botón de una versión anterior; usa /novedades.', show_alert=True)
+        return
+    item_id = q.data[4:]
+    with conn() as c:
+        c.row_factory = sqlite3.Row
+        row = c.execute('SELECT * FROM items WHERE id=? AND kind=?', (item_id, 'movies')).fetchone()
+        done = bool(c.execute('SELECT 1 FROM downloaded WHERE chat_id=? AND id=?', (q.message.chat_id, item_id)).fetchone())
+    if not row:
+        await q.answer('Película no encontrada. Actualiza /novedades.', show_alert=True)
+        return
+    if done:
+        await q.answer('Ya fue añadida.', show_alert=True)
+        return
+    await q.answer('Enviando a qBittorrent…')
+    try:
+        await asyncio.to_thread(submit, dict(row))
         with conn() as c:
-            c.row_factory = sqlite3.Row
-            items = [dict(x) for x in c.execute('SELECT i.* FROM items i JOIN selections s ON s.id=i.id WHERE s.chat_id=?', (chat,))]
-        if not items:
-            return await q.message.reply_text('No hay novedades seleccionadas.')
-        await q.message.reply_text(f'Procesando {len(items)} selecciones…')
-        results = []
-        for item in items:
-            try:
-                await asyncio.to_thread(submit, item)
-                results.append(f'✅ {item["title"][:80]} ({item["kind"]})')
-                with conn() as c:
-                    c.execute('DELETE FROM selections WHERE chat_id=? AND id=?', (chat, item['id']))
-            except Exception as exc:
-                LOG.exception('Error añadiendo %s', item['title'])
-                results.append(f'❌ {item["title"][:65]}: {str(exc)[:110]}')
-        for offset in range(0, len(results), 15):
-            await q.message.reply_text('\n'.join(results[offset:offset+15])[:3900])
-        return
-    if data.startswith('v:'):
-        _, kind, page = data.split(':')
-    elif data.startswith('s:'):
-        _, item_id, kind, page = data.split(':')
-        with conn() as c:
-            exists = c.execute('SELECT 1 FROM selections WHERE chat_id=? AND id=?', (chat,item_id)).fetchone()
-            if exists:
-                c.execute('DELETE FROM selections WHERE chat_id=? AND id=?', (chat,item_id))
-            else:
-                c.execute('INSERT OR IGNORE INTO selections(chat_id,id) VALUES(?,?)', (chat,item_id))
-    else:
-        return
-    msg, keyboard = view(chat, kind, int(page))
-    await q.edit_message_text(msg, reply_markup=keyboard)
-
+            c.execute('INSERT OR IGNORE INTO downloaded(chat_id,id) VALUES(?,?)', (q.message.chat_id, item_id))
+        await q.edit_message_reply_markup(reply_markup=keyboard(dict(row), True))
+        await q.message.reply_text('✅ Añadida a qBittorrent (movies): ' + row['title'][:140])
+    except Exception as exc:
+        LOG.exception('Error descargando %s', row['title'])
+        await q.message.reply_text('❌ No se pudo añadir: ' + str(exc)[:250])
 
 async def daily(context: ContextTypes.DEFAULT_TYPE):
     with conn() as c:
         chats = [r[0] for r in c.execute('SELECT chat_id FROM chats')]
-    # Refresh once, then send the same day's list to all subscribers.
-    try:
-        await asyncio.to_thread(refresh)
-    except Exception:
-        LOG.exception('No se pudo actualizar el listado diario')
     for chat in chats:
-        await digest(context.application, chat, refresh_first=False)
+        await digest(context.application, chat, refresh_first=True)
 
 
 async def post_init(app):
