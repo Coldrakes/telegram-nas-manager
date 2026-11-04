@@ -1,34 +1,8 @@
 services:
-  telegram-nas-manager:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: telegram-nas-manager
+  telegram-novedades:
+    build: .
+    container_name: telegram-novedades
     restart: unless-stopped
-
-    env_file:
-      - .env
-
-    environment:
-      MOVIES_PATH: /data/Peliculas
-      SERIES_PATH: /data/Series
-      THREED_PATH: /data/3D
-      TEMP_PATH: /data/temp
-      TG_SESSION_PATH: /app/session/telegram_bot
-      TG_PROGRESS_INTERVAL: ${TG_PROGRESS_INTERVAL:-30}
-      AUTO_EXTRACT: "True"
-      DELETE_ARCHIVES_AFTER_EXTRACT: ${DELETE_ARCHIVES_AFTER_EXTRACT:-True}
-      BATCH_DB_PATH: /app/data/batches.db
+    env_file: .env
     volumes:
-      # Cambia estas rutas en .env por las rutas reales de tu NAS.
-      - ${MOVIES_HOST_PATH:-./data/Peliculas}:/data/Peliculas
-      - ${SERIES_HOST_PATH:-./data/Series}:/data/Series
-      - ${THREED_HOST_PATH:-./data/3D}:/data/3D
-
-      # Temporal: debe tener espacio suficiente para el lote.
-      - ${TEMP_HOST_PATH:-./data/temp}:/data/temp
-
-      # Persistencia de la sesión MTProto de Telethon.
-      - ${SESSION_HOST_PATH:-./data/session}:/app/session
-      # Estado SQLite persistente de lotes manuales.
-      - ${DATA_HOST_PATH:-./data/state}:/app/data
+      - ./data:/app/data

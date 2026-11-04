@@ -1,28 +1,32 @@
-# ColdNas Manager
+# Bot Telegram: novedades -> qBittorrent
 
-Bot de Telegram para descargar lotes manuales al NAS (Películas, Series y 3D).
+Reemplazo del antiguo ColdNas Manager. Sin Telethon, sin lotes ni Radarr/Sonarr.
 
-## Despliegue
+## Instalación en NAS UGREEN
 
-1. Copia `.env.example` a `.env` y configura `BOT_TOKEN`, `API_ID`, `API_HASH`, `ALLOWED_USERS` y las rutas `*_HOST_PATH`.
-2. Mantén persistentes los volúmenes `/app/data`, `/app/session`, `/data/temp` y los destinos del NAS.
-3. Ejecuta `docker compose up -d --build`.
-4. Abre `/start`, selecciona «Nuevo lote», envía archivos y cierra el lote para descargar.
+1. Copiar esta carpeta al NAS (por ejemplo `/volume1/docker/telegram-novedades`).
+2. Copiar `.env.example` a `.env` y rellenar `BOT_TOKEN`, `ALLOWED_USERS`, `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD`.
+3. Si qBittorrent está en otra pila de Portainer, `QBIT_URL` puede apuntar a la IP LAN del NAS y el puerto publicado de su Web UI, por ejemplo `http://192.168.100.100:8080` (ajustar al puerto real).
+4. En el directorio del proyecto ejecutar `docker compose up -d --build` o desplegar con Portainer usando el Dockerfile y Compose adjuntos.
+5. Enviar `/start` al bot **desde la cuenta autorizada** para registrar el chat y activar el resumen diario. Probar `/novedades`.
+6. Asegurar que qBittorrent tenga creadas las categorías exactas `movies` y `tv`.
 
-## Configuración
+## Funcionamiento
 
-- `TG_MAX_PARALLEL=3`: descargas simultáneas.
-- `TG_PROGRESS_INTERVAL=30`: refresco entre 30 y 60 segundos (usar 60 para menos peticiones).
-- `BATCH_DB_PATH=/app/data/batches.db`: persistencia SQLite.
-- Los archivos comprimidos reconocidos se extraen tras terminar todas las descargas, se prueban con 7z y se eliminan al extraerse correctamente.
-- Los destinos se sobrescriben cuando existe un archivo con el mismo nombre.
+- 07:00 Europe/Madrid: consulta `/ultimos`, publica las secciones Películas y Series y abre una selección múltiple paginada.
+- `/novedades`: consulta inmediata.
+- Los elementos seleccionados se consultan en su ficha. Se descarga el `.torrent` por HTTPS y se entrega a la Web API de qBittorrent con su categoría.
+- La selección queda persistida en SQLite hasta que se añade correctamente o se desmarca.
+- No se comunica con Radarr ni Sonarr.
 
-## Recuperación
+## Limitación importante de esta primera versión
 
-Los lotes cerrados pendientes se recuperan al iniciar. Los archivos ya completos y presentes en el directorio temporal no se descargan de nuevo. Una transferencia interrumpida se reinicia desde cero para ese archivo; Telethon `download_media` no garantiza reanudación por bytes.
+**El extractor HTML es una implementación inicial, no verificada en vivo contra la estructura actual de DonTorrent.** La página puede necesitar selectores específicos y su botón de descarga podría generar el enlace mediante JavaScript. En ese caso el bot informará `No se encontró enlace .torrent en el HTML` y NO adivinará la URL. Para completar la integración hay que contrastar el HTML de `/ultimos` y una ficha concreta, y adaptar `parse_latest()` y `find_torrent()` si corresponde. Si una ficha tiene varios torrents, la versión actual se detiene para evitar descargar uno equivocado.
 
-## Avisos
+**No se ha probado contra Telegram ni contra tu qBittorrent real.** Realizar una prueba con un torrent de distribución autorizada antes de usarlo habitualmente.
 
-Esta versión se ha comprobado mediante compilación de Python, pero **no se ha probado en Telegram ni en el NAS**. Antes de producción, prueba con un lote pequeño y conserva copia de seguridad de los archivos que puedan sobrescribirse. La pausa afecta a nuevos archivos, no a transferencias ya iniciadas. La recuperación durante extracción y movimiento no es totalmente transaccional.
+El bot no evita duplicados por hash por sí mismo: qBittorrent gestiona el rechazo de torrents ya añadidos. La respuesta de la API indica aceptación, no confirma la descarga posterior.
 
-Consulta `CHANGES.md` para detalles.
+## Seguridad
+
+Mantener `.env` privado. `ALLOWED_USERS` es obligatorio. No publicar la Web UI de qBittorrent en Internet; usar solo acceso LAN/Docker. El bot limita las URLs descargadas al dominio configurado, exige HTTPS y no sigue redirecciones HTTP. Usa solo torrents cuyo contenido tengas autorización para descargar.
