@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import qbittorrentapi
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
@@ -23,6 +25,9 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 LOG = logging.getLogger(__name__)
+# httpx logs Telegram API URLs containing the bot token; never log them.
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
 TOKEN = os.environ['BOT_TOKEN']
 USERS = {int(v.strip()) for v in os.environ['ALLOWED_USERS'].split(',') if v.strip()}
 if not USERS:
@@ -35,12 +40,21 @@ DB = Path('/app/data/state.sqlite3')
 PAGE_SIZE = 8
 SESSION = requests.Session()
 SESSION.headers.update({'User-Agent': 'Mozilla/5.0 (compatible; TelegramNovedades/1.0)'})
+retry = Retry(total=3, connect=3, read=2, backoff_factor=1,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=frozenset(['GET']), respect_retry_after_header=True)
+SESSION.mount('https://', HTTPAdapter(max_retries=retry))
+QUALITY_ORDER = {'4k': 1, 'bdremux-1080p': 2, 'bluray-1080p': 3,
+                 'microhd-1080p': 4, 'hdtv-1080p': 5, 'hdrip': 6,
+                 'hdtv': 7, 'dvdrip': 8}
+
 
 
 def conn():
     c = sqlite3.connect(DB)
     c.execute('CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)')
     c.execute('CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, title TEXT, kind TEXT, url TEXT, torrent_url TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS detail_cache (id TEXT PRIMARY KEY, torrent_url TEXT, updated_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS selections (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
     c.execute('CREATE TABLE IF NOT EXISTS downloaded (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
     return c
@@ -71,21 +85,14 @@ def kind_from(text, href, context=''):
 
 
 def quality_rank(value):
-    """Higher resolution first; then higher-quality source at same resolution."""
-    q = (value or '').lower()
-    if re.search(r'\b(?:4k|2160p|uhd)\b', q):
-        return 600
-    if '1080p' in q:
-        return 500 if 'remux' in q else 490 if 'bluray' in q else 480
-    if '720p' in q:
-        return 400
-    if 'bluray' in q or 'bdrip' in q:
-        return 350
-    if 'web-dl' in q or 'webrip' in q:
-        return 320
-    if 'dvdrip' in q or 'dvd' in q:
-        return 200
-    return 0
+    q = (value or '').lower().strip()
+    q = re.sub(r'[\s_]+', '-', q)
+    q = q.replace('bd-remux', 'bdremux').replace('blu-ray', 'bluray')
+    # Match explicit formats; avoid confusing 1080p MicroHD with generic 1080p.
+    for quality in sorted(QUALITY_ORDER, key=len, reverse=True):
+        if quality in q:
+            return QUALITY_ORDER[quality]
+    return 99
 
 
 def alphabetical_key(value):
@@ -121,11 +128,11 @@ def parse_latest():
         if not dates or dates[-1] != yesterday:
             continue
         tail = row_text.split(title, 1)[-1][:100] if title in row_text else '' 
-        quality_match = re.search(r'\((4K|[^()]{2,40}(?:1080p|720p|DVDRip|BluRay|WEB[- .]?DL)[^()]{0,20})\)', tail, re.I)
+        quality_match = re.search(r'\((4K|BDremux-1080p|BluRay-1080p|MicroHD-1080p|HDTV-1080p|HDRip|HDTV|DVDRip)\)', tail, re.I)
         quality = quality_match.group(1) if quality_match else (re.search(r'\[(4K)\]', title, re.I).group(1) if re.search(r'\[(4K)\]', title, re.I) else '')
         found.append({'id': hashlib.sha256(href.encode()).hexdigest()[:16], 'title': title, 'kind': 'movies', 'url': href, 'quality': quality})
     # Quality descending, title alphabetically ascending within each quality.
-    found.sort(key=lambda item: (-quality_rank(item['quality'] + ' ' + item['title']), alphabetical_key(item['title']), item['url']))
+    found.sort(key=lambda item: (quality_rank(item['quality'] or item['title']), alphabetical_key(item['title']), item['url']))
     return found[:MAX_ITEMS]
 
 
@@ -176,6 +183,9 @@ def detail(item):
                 break
         if image:
             break
+    candidates = extract_torrent_links(soup, item['url'])
+    if len(candidates) == 1:
+        cache_torrent(item['id'], candidates[0])
     return {'title': title, 'description': desc, 'genres': genres, 'quality': quality, 'image': image}
 
 
@@ -227,21 +237,41 @@ def refresh():
     return items
 
 
-def find_torrent(item):
-    soup = get_html(item['url'])
-    candidates = []
+def extract_torrent_links(soup, page_url):
+    candidates = set()
     for tag in soup.select('a[href], [data-url], [data-href]'):
         raw = tag.get('href') or tag.get('data-url') or tag.get('data-href')
         if not raw:
             continue
-        link = urljoin(item['url'], raw)
+        link = urljoin(page_url, raw)
         if urlparse(link).path.lower().endswith('.torrent'):
-            candidates.append(safe_url(link))
+            candidates.add(safe_url(link))
+    return sorted(candidates)
+
+
+def cache_torrent(item_id, url):
+    with conn() as c:
+        c.execute('INSERT INTO detail_cache(id,torrent_url,updated_at) VALUES(?,?,?) '
+                  'ON CONFLICT(id) DO UPDATE SET torrent_url=excluded.torrent_url,updated_at=excluded.updated_at',
+                  (item_id, safe_url(url), datetime.now(TZ).isoformat()))
+        c.execute('UPDATE items SET torrent_url=? WHERE id=?', (safe_url(url), item_id))
+
+
+def find_torrent(item):
+    # Cached link avoids another slow HTML request when the user taps Download.
+    with conn() as c:
+        cached = c.execute('SELECT torrent_url FROM detail_cache WHERE id=?', (item['id'],)).fetchone()
+    if cached and cached[0]:
+        return safe_url(cached[0])
+    if item.get('torrent_url'):
+        return safe_url(item['torrent_url'])
+    soup = get_html(item['url'])
+    candidates = extract_torrent_links(soup, item['url'])
     if not candidates:
-        raise ValueError('No se encontró enlace .torrent en el HTML de la ficha; requiere revisar el JavaScript de la web')
-    # Do not guess which torrent is intended when several releases exist.
-    if len(set(candidates)) != 1:
-        raise ValueError(f'La ficha contiene {len(set(candidates))} torrents distintos; selección ambigua')
+        raise ValueError('No hay enlace .torrent directo en la ficha; no se puede identificar la descarga con seguridad')
+    if len(candidates) != 1:
+        raise ValueError(f'La ficha contiene {len(candidates)} torrents; selección ambigua')
+    cache_torrent(item['id'], candidates[0])
     return candidates[0]
 
 
