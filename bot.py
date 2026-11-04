@@ -5,8 +5,9 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import sqlite3
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
 from html import escape
@@ -69,10 +70,34 @@ def kind_from(text, href, context=''):
     return None
 
 
+def quality_rank(value):
+    """Higher resolution first; then higher-quality source at same resolution."""
+    q = (value or '').lower()
+    if re.search(r'\b(?:4k|2160p|uhd)\b', q):
+        return 600
+    if '1080p' in q:
+        return 500 if 'remux' in q else 490 if 'bluray' in q else 480
+    if '720p' in q:
+        return 400
+    if 'bluray' in q or 'bdrip' in q:
+        return 350
+    if 'web-dl' in q or 'webrip' in q:
+        return 320
+    if 'dvdrip' in q or 'dvd' in q:
+        return 200
+    return 0
+
+
+def alphabetical_key(value):
+    value = unicodedata.normalize('NFKD', value or '')
+    return ''.join(ch for ch in value if not unicodedata.combining(ch)).casefold()
+
+
 def parse_latest():
     """Only actual movie detail URLs from the releases list, never menu/category links."""
     soup = get_html(SOURCE)
     found, seen = [], set()
+    yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
     for a in soup.select('a[href]'):
         href = urljoin(SOURCE, a.get('href', ''))
         p = urlparse(href)
@@ -89,13 +114,19 @@ def parse_latest():
         # The release list has the format immediately after the linked title.
         row = a.find_parent(['li', 'tr', 'p']) or a.parent
         row_text = row.get_text(' ', strip=True) if row else ''
-        tail = row_text.split(title, 1)[-1][:100] if title in row_text else ''
+        # The /ultimos list prints the publication date immediately before each title.
+        # Never substitute the movie release year or the date of the detail page.
+        prefix = row_text.split(title, 1)[0] if title in row_text else ''
+        dates = re.findall(r'(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)', prefix)
+        if not dates or dates[-1] != yesterday:
+            continue
+        tail = row_text.split(title, 1)[-1][:100] if title in row_text else '' 
         quality_match = re.search(r'\((4K|[^()]{2,40}(?:1080p|720p|DVDRip|BluRay|WEB[- .]?DL)[^()]{0,20})\)', tail, re.I)
         quality = quality_match.group(1) if quality_match else (re.search(r'\[(4K)\]', title, re.I).group(1) if re.search(r'\[(4K)\]', title, re.I) else '')
         found.append({'id': hashlib.sha256(href.encode()).hexdigest()[:16], 'title': title, 'kind': 'movies', 'url': href, 'quality': quality})
-        if len(found) >= MAX_ITEMS:
-            break
-    return found
+    # Quality descending, title alphabetically ascending within each quality.
+    found.sort(key=lambda item: (-quality_rank(item['quality'] + ' ' + item['title']), alphabetical_key(item['title']), item['url']))
+    return found[:MAX_ITEMS]
 
 
 def text_of(soup, selectors):
@@ -274,9 +305,9 @@ async def digest(app, chat_id, refresh_first=True):
     try:
         items = await asyncio.to_thread(refresh) if refresh_first else parse_latest()
         if not items:
-            await app.bot.send_message(chat_id, 'No se han identificado películas en /ultimos. Comprueba si ha cambiado el HTML.')
+            await app.bot.send_message(chat_id, 'No hay películas publicadas ayer en /ultimos (o no se pudo identificar su fecha).')
             return
-        await app.bot.send_message(chat_id, f'🎬 Novedades de películas: {len(items)} fichas. Pulsa Descargar en las que quieras añadir a qBittorrent.')
+        await app.bot.send_message(chat_id, f'🎬 Películas publicadas ayer ({(datetime.now(TZ).date() - timedelta(days=1)).strftime("%d/%m/%Y")}): {len(items)} fichas. Orden: calidad descendente y título alfabético.')
         for item in items:
             await send_card(app, chat_id, item)
             await asyncio.sleep(0.12)
