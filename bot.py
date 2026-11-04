@@ -70,26 +70,29 @@ def kind_from(text, href, context=''):
 
 
 def parse_latest():
-    """Read the current /ultimos page, retaining only movie release links."""
+    """Only actual movie detail URLs from the releases list, never menu/category links."""
     soup = get_html(SOURCE)
     found, seen = [], set()
     for a in soup.select('a[href]'):
         href = urljoin(SOURCE, a.get('href', ''))
         p = urlparse(href)
-        if p.hostname != DOMAIN or p.scheme != 'https' or href in seen:
+        # DonTorrent movie detail routes are /pelicula/<numeric-id>/<slug>.
+        # This intentionally excludes /peliculas, /peliculas-hd, /documentales, etc.
+        if p.hostname != DOMAIN or p.scheme != 'https' or not re.fullmatch(r'/pelicula/\d+/[^/]+/?', p.path, re.I):
             continue
-        if href.rstrip('/') == SOURCE.rstrip('/') or '/torrents/' in p.path or p.path.endswith('.torrent'):
+        if href in seen:
             continue
-        parent = a.find_parent(['article', 'tr', 'li', 'div'])
-        context = parent.get_text(' ', strip=True)[:250] if parent else ''
         title = a.get_text(' ', strip=True) or (a.find('img').get('alt', '') if a.find('img') else '')
-        kind = kind_from(title, href, context)
-        if kind != 'movies' or len(title) < 4 or len(title) > 180:
-            continue
-        if p.path.rstrip('/').lower() in ('/series', '/peliculas', '/peliculas-estrenos', '/ultimos'):
+        if not title or len(title) > 180:
             continue
         seen.add(href)
-        found.append({'id': hashlib.sha256(href.encode()).hexdigest()[:16], 'title': title, 'kind': 'movies', 'url': href})
+        # The release list has the format immediately after the linked title.
+        row = a.find_parent(['li', 'tr', 'p']) or a.parent
+        row_text = row.get_text(' ', strip=True) if row else ''
+        tail = row_text.split(title, 1)[-1][:100] if title in row_text else ''
+        quality_match = re.search(r'\((4K|[^()]{2,40}(?:1080p|720p|DVDRip|BluRay|WEB[- .]?DL)[^()]{0,20})\)', tail, re.I)
+        quality = quality_match.group(1) if quality_match else (re.search(r'\[(4K)\]', title, re.I).group(1) if re.search(r'\[(4K)\]', title, re.I) else '')
+        found.append({'id': hashlib.sha256(href.encode()).hexdigest()[:16], 'title': title, 'kind': 'movies', 'url': href, 'quality': quality})
         if len(found) >= MAX_ITEMS:
             break
     return found
@@ -105,25 +108,43 @@ def text_of(soup, selectors):
     return ''
 
 
+def labeled_field(soup, label):
+    # Fields on movie pages are rendered as "Género: Acción - Drama" etc.
+    text = soup.get_text('\n', strip=True)
+    match = re.search(r'(?im)^' + re.escape(label) + r'\s*:\s*([^\n]{0,180})', text)
+    if match and match.group(1).strip():
+        return match.group(1).strip()
+    match = re.search(r'(?im)^' + re.escape(label) + r'\s*:\s*\n([^\n]{1,180})', text)
+    return match.group(1).strip() if match else ''
+
+
 def detail(item):
     soup = get_html(item['url'])
     title = text_of(soup, ['h1', 'meta[property="og:title"]']) or item['title']
-    desc = text_of(soup, ['.sinopsis', '.synopsis', '.descripcion', '.description', '[itemprop="description"]', 'meta[name="description"]', 'meta[property="og:description"]'])
-    genres = text_of(soup, ['.generos', '.genres', '.genre', '[itemprop="genre"]'])
-    quality = text_of(soup, ['.calidad', '.quality', '.formato', '.format'])
+    desc = labeled_field(soup, 'Descripción') or text_of(soup, ['.sinopsis', '.synopsis', '.descripcion', '.description', '[itemprop="description"]'])
+    genres = labeled_field(soup, 'Género') or text_of(soup, ['.generos', '.genres', '.genre', '[itemprop="genre"]'])
+    quality = labeled_field(soup, 'Formato') or item.get('quality', '')
     if not quality:
         m = re.search(r'\b(2160p|1080p|720p|4k|bluray|web[- .]?dl|hdtv|remux)\b', item['title'], re.I)
         quality = m.group(0) if m else ''
     image = ''
-    for selector in ['meta[property="og:image"]', '.poster img', '.cover img', '.caratula img', 'article img', 'main img']:
-        node = soup.select_one(selector)
-        if node:
-            raw = node.get('content') or node.get('data-src') or node.get('src')
-            if raw:
-                candidate = urljoin(item['url'], raw)
-                if urlparse(candidate).scheme == 'https' and urlparse(candidate).hostname == DOMAIN:
-                    image = candidate
-                    break
+    # DonTorrent commonly serves poster images through images.weserv.nl,
+    # which the previous same-domain-only check incorrectly rejected.
+    for selector in ['meta[property="og:image"]', 'img[alt]', '.poster img', '.cover img', '.caratula img', 'article img', 'main img']:
+        for node in soup.select(selector):
+            alt = (node.get('alt') or '').lower()
+            if selector == 'img[alt]' and not (title.lower()[:12] in alt or alt[:12] in title.lower() and len(alt) > 5):
+                continue
+            raw = node.get('content') or node.get('data-src') or node.get('data-original') or node.get('src')
+            if not raw:
+                continue
+            candidate = urljoin(item['url'], raw)
+            parsed = urlparse(candidate)
+            if parsed.scheme == 'https' and parsed.hostname in (DOMAIN, 'images.weserv.nl'):
+                image = candidate
+                break
+        if image:
+            break
     return {'title': title, 'description': desc, 'genres': genres, 'quality': quality, 'image': image}
 
 
@@ -154,7 +175,9 @@ async def send_card(app, chat_id, item):
     body = caption(item, info)
     if info['image']:
         try:
-            r = await asyncio.to_thread(lambda: SESSION.get(safe_url(info['image']), timeout=20, allow_redirects=False))
+            r = await asyncio.to_thread(lambda: SESSION.get(info['image'], timeout=20, allow_redirects=False) if urlparse(info['image']).hostname in (DOMAIN, 'images.weserv.nl') else None)
+            if r is None:
+                raise ValueError('Dominio de imagen no permitido')
             r.raise_for_status()
             if r.headers.get('content-type', '').lower().startswith('image/') and len(r.content) < 9_000_000:
                 import io
