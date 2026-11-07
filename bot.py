@@ -53,6 +53,7 @@ QUALITY_ORDER = {'4k': 1, 'bdremux-1080p': 2, 'bluray-1080p': 3,
 def conn():
     c = sqlite3.connect(DB)
     c.execute('CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY)')
+    c.execute('CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
     c.execute('CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, title TEXT, kind TEXT, url TEXT, torrent_url TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS detail_cache (id TEXT PRIMARY KEY, torrent_url TEXT, updated_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS selections (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
@@ -395,7 +396,7 @@ def view(chat_id, kind='all', page=0):
     return f'Novedades · {"Películas" if kind=="movies" else "Series" if kind=="tv" else "Todas"} · {len(rows)} elementos\nPulsa para seleccionar varios:', InlineKeyboardMarkup(buttons)
 
 
-async def digest(app, chat_id, refresh_first=True):
+async def digest_movies(app, chat_id, refresh_first=True):
     try:
         items = await asyncio.to_thread(refresh) if refresh_first else parse_latest()
         if not items:
@@ -424,18 +425,60 @@ async def digest(app, chat_id, refresh_first=True):
         LOG.exception('Error al consultar novedades')
         await app.bot.send_message(chat_id, f'Error al consultar novedades: {str(exc)[:300]}')
 
+async def digest_series(app, chat_id):
+    try:
+        prepared = await asyncio.to_thread(refresh_series)
+        date = (datetime.now(TZ).date() - timedelta(days=1)).strftime('%d/%m/%Y')
+        if not prepared:
+            await app.bot.send_message(chat_id, f'📺 No se encontraron series publicadas ayer ({date}).')
+            return
+        await app.bot.send_message(chat_id, f'📺 Series con novedades del {date}: {len(prepared)} fichas (serie + temporada + calidad).')
+        for group, meta in prepared:
+            await send_series_card(app, chat_id, group, meta)
+            await asyncio.sleep(0.12)
+    except Exception as exc:
+        LOG.exception('Error al consultar series')
+        await app.bot.send_message(chat_id, f'❌ Error al consultar series: {str(exc)[:250]}')
+
+
+async def digest_all(app, chat_id):
+    # Los errores de películas no impiden el envío de las series.
+    await digest_movies(app, chat_id)
+    await digest_series(app, chat_id)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not permitted(update):
         return await deny(update)
+    chat_id = update.effective_chat.id
     with conn() as c:
-        c.execute('INSERT OR IGNORE INTO chats(chat_id) VALUES(?)', (update.effective_chat.id,))
-    await update.message.reply_text('Bot activado. Películas diarias a las 07:00. Usa /novedades para películas y /series para series de ayer.')
+        is_new = c.execute('SELECT 1 FROM chats WHERE chat_id=?', (chat_id,)).fetchone() is None
+        c.execute('INSERT OR IGNORE INTO chats(chat_id) VALUES(?)', (chat_id,))
+    if is_new:
+        await update.message.reply_text(
+            '👋 ¡Bienvenido a Telegram NAS Manager!\n'
+            '🎬 /peliculas: películas publicadas ayer\n'
+            '📺 /series: series publicadas ayer\n'
+            '🆕 /novedades: películas y series\n'
+            '⏰ Recibirás las novedades todos los días a las 07:00 (Europe/Madrid).\n'
+            '🚀 Te envío las novedades disponibles ahora mismo.')
+        await digest_all(context.application, chat_id)
+    else:
+        await update.message.reply_text('✅ Ya estás registrado. Usa /novedades, /peliculas o /series. El envío diario es a las 07:00.')
 
 
 async def novedades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not permitted(update):
         return await deny(update)
-    await digest(context.application, update.effective_chat.id)
+    await update.message.reply_text('🆕 Consultando películas y series publicadas ayer…')
+    await digest_all(context.application, update.effective_chat.id)
+
+
+async def peliculas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not permitted(update):
+        return await deny(update)
+    await update.message.reply_text('🎬 Buscando películas publicadas ayer…')
+    await digest_movies(context.application, update.effective_chat.id)
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,16 +522,50 @@ async def daily(context: ContextTypes.DEFAULT_TYPE):
     with conn() as c:
         chats = [r[0] for r in c.execute('SELECT chat_id FROM chats')]
     for chat in chats:
-        await digest(context.application, chat, refresh_first=True)
+        try:
+            await digest_all(context.application, chat)
+        except Exception:
+            LOG.exception('Error en resumen diario para chat %s', chat)
+
+
+async def startup_digest(context: ContextTypes.DEFAULT_TYPE):
+    # En cada arranque del contenedor se envían novedades, sin esperar a las 07:00.
+    # El saludo solo se manda una vez por chat, persistiendo en SQLite.
+    with conn() as c:
+        chats = [r[0] for r in c.execute('SELECT chat_id FROM chats')]
+    for chat in chats:
+        try:
+            key = f'welcome_sent:{chat}'
+            with conn() as c:
+                welcomed = c.execute('SELECT 1 FROM bot_meta WHERE key=?', (key,)).fetchone() is not None
+            if not welcomed:
+                await context.application.bot.send_message(
+                    chat, '👋 ¡Telegram NAS Manager está en marcha!\n'
+                          '🆕 Te envío las novedades de películas y series.\n'
+                          '⏰ El próximo resumen automático será a las 07:00 (Europe/Madrid).')
+                with conn() as c:
+                    c.execute('INSERT OR IGNORE INTO bot_meta(key,value) VALUES(?,?)', (key, '1'))
+            await digest_all(context.application, chat)
+        except Exception:
+            LOG.exception('Error en el envío de arranque para chat %s', chat)
 
 
 async def post_init(app):
     DB.parent.mkdir(parents=True, exist_ok=True)
     with conn():
         pass
-    app.job_queue.run_daily(daily, time=time(int(os.getenv('DAILY_HOUR','7')), int(os.getenv('DAILY_MINUTE','0')), tzinfo=TZ), name='daily-digest')
-    await app.bot.set_my_commands([('start','Activar resumen diario'),('novedades','Ver películas de ayer'),('series','Ver series de ayer')])
-
+    app.job_queue.run_daily(
+        daily,
+        time=time(int(os.getenv('DAILY_HOUR','7')), int(os.getenv('DAILY_MINUTE','0')), tzinfo=TZ),
+        name='daily-digest',
+    )
+    app.job_queue.run_once(startup_digest, when=3, name='startup-digest')
+    await app.bot.set_my_commands([
+        ('start','Registrar chat y recibir novedades'),
+        ('novedades','Películas y series de ayer'),
+        ('peliculas','Solo películas de ayer'),
+        ('series','Solo series de ayer'),
+    ])
 
 
 # --- Series: una ficha por URL (serie + temporada + calidad) ---
@@ -523,7 +600,11 @@ def series_metadata(soup, group):
     season_match = re.search(r'(\d+)\s*[ªºa]?\s*temporada', heading, re.I)
     season = int(season_match.group(1)) if season_match else 0
     series_name = re.split(r'\s*[-–]\s*\d+\s*[ªºa]?\s*temporada', heading, maxsplit=1, flags=re.I)[0].strip()
-    quality = labeled_field(soup, 'Formato') or re.search(r'\[([^]]+)\]', heading).group(1) if re.search(r'\[([^]]+)\]', heading) else labeled_field(soup, 'Formato')
+    # La calidad real de la ficha tiene prioridad; si falta, leer la etiqueta del título.
+    quality = labeled_field(soup, 'Formato')
+    if not quality:
+        bracket = re.search(r'\[([^]]+)\]', heading)
+        quality = bracket.group(1) if bracket else ''
     description = labeled_field(soup, 'Descripción')
     image = ''
     for node in soup.select('meta[property="og:image"], img[alt], .poster img, .cover img'):
@@ -574,7 +655,14 @@ def refresh_series():
             prepared.append((group, meta))
         except Exception:
             LOG.exception('Error leyendo episodios de %s', group['url'])
-    prepared.sort(key=lambda pair: (quality_rank(pair[1]['quality']), alphabetical_key(pair[1]['name']), pair[1]['season']))
+    # Orden de publicación en Telegram: calidad descendente, nombre A-Z y temporada ascendente.
+    # Se ordena después de leer las fichas y antes del envío secuencial.
+    prepared.sort(key=lambda pair: (
+        quality_rank(pair[1]['quality']),
+        alphabetical_key(pair[1]['name']),
+        int(pair[1]['season']),
+        pair[0]['url'],
+    ))
     with conn() as c:
         for group, meta in prepared:
             c.execute('INSERT INTO series_groups(id,title,season,quality,url) VALUES(?,?,?,?,?) '
@@ -632,17 +720,8 @@ async def send_series_card(app, chat_id, group, meta):
 async def series_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not permitted(update):
         return await deny(update)
-    chat_id = update.effective_chat.id
     await update.message.reply_text('📺 Buscando series publicadas ayer y leyendo sus capítulos…')
-    prepared = await asyncio.to_thread(refresh_series)
-    if not prepared:
-        await update.message.reply_text('No se encontraron fichas de series con episodios descargables publicados ayer. Revisa los logs del contenedor.')
-        return
-    date = (datetime.now(TZ).date() - timedelta(days=1)).strftime('%d/%m/%Y')
-    await update.message.reply_text(f'📺 Series con novedades del {date}: {len(prepared)} fichas (serie + temporada + calidad).')
-    for group, meta in prepared:
-        await send_series_card(context.application, chat_id, group, meta)
-        await asyncio.sleep(0.12)
+    await digest_series(context.application, update.effective_chat.id)
 
 
 def episode_picker(chat_id, group_id, page=0):
@@ -799,6 +878,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('novedades', novedades))
+    app.add_handler(CommandHandler('peliculas', peliculas_command))
     app.add_handler(CommandHandler('series', series_command))
     app.add_handler(CallbackQueryHandler(callback))
     app.run_polling(drop_pending_updates=True)
