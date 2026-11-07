@@ -85,13 +85,11 @@ def kind_from(text, href, context=''):
 
 
 def quality_rank(value):
-    q = (value or '').lower().strip()
-    q = re.sub(r'[\s_]+', '-', q)
-    q = q.replace('bd-remux', 'bdremux').replace('blu-ray', 'bluray')
-    # Match explicit formats; avoid confusing 1080p MicroHD with generic 1080p.
-    for quality in sorted(QUALITY_ORDER, key=len, reverse=True):
-        if quality in q:
-            return QUALITY_ORDER[quality]
+    q = unicodedata.normalize('NFKD', str(value or '')).casefold()
+    q = re.sub(r'[^a-z0-9]', '', q)
+    for quality, priority in QUALITY_ORDER.items():
+        if re.sub(r'[^a-z0-9]', '', quality) in q:
+            return priority
     return 99
 
 
@@ -205,9 +203,10 @@ def keyboard(item, downloaded=False):
     return InlineKeyboardMarkup([[InlineKeyboardButton('✅ Añadida a qBittorrent' if downloaded else '📥 Descargar', callback_data='done' if downloaded else 'get:' + item['id'])]])
 
 
-async def send_card(app, chat_id, item):
+async def send_card(app, chat_id, item, info=None):
     try:
-        info = await asyncio.to_thread(detail, item)
+        if info is None:
+            info = await asyncio.to_thread(detail, item)
     except Exception:
         LOG.exception('No se pudo leer la ficha %s', item['url'])
         info = {'title': item['title'], 'description': '', 'genres': '', 'quality': '', 'image': ''}
@@ -351,7 +350,11 @@ def submit(item):
     if item['kind'] not in qb.torrents_categories():
         raise ValueError(f'No existe la categoría {item["kind"]} en qBittorrent')
     result = qb.torrents_add(torrent_files=content, category=item['kind'])
-    if str(result).strip().lower() != 'ok.':
+    # qbittorrent-api >= 2025 devuelve TorrentsAddedMetadata en vez de 'Ok.'.
+    if hasattr(result, 'success_count'):
+        if result.success_count < 1 or result.failure_count > 0:
+            raise RuntimeError(f'qBittorrent no confirmó la descarga: {result}')
+    elif str(result).strip().lower() not in ('ok.', 'ok', 'true'):
         raise RuntimeError(f'qBittorrent respondió: {result}')
     return url
 
@@ -394,9 +397,24 @@ async def digest(app, chat_id, refresh_first=True):
         if not items:
             await app.bot.send_message(chat_id, 'No hay películas publicadas ayer en /ultimos (o no se pudo identificar su fecha).')
             return
-        await app.bot.send_message(chat_id, f'🎬 Películas publicadas ayer ({(datetime.now(TZ).date() - timedelta(days=1)).strftime("%d/%m/%Y")}): {len(items)} fichas. Orden: calidad descendente y título alfabético.')
+        # El formato fiable está en la ficha, no siempre en /ultimos.
+        # Consultar primero todas las fichas para ordenar por calidad real.
+        cards = []
         for item in items:
-            await send_card(app, chat_id, item)
+            try:
+                info = await asyncio.to_thread(detail, item)
+            except Exception:
+                LOG.exception('No se pudo leer la ficha %s', item['url'])
+                info = {'title': item['title'], 'description': '', 'genres': '', 'quality': item.get('quality', ''), 'image': ''}
+            cards.append((item, info))
+        cards.sort(key=lambda pair: (
+            quality_rank(pair[1].get('quality') or pair[0].get('quality') or pair[0]['title']),
+            alphabetical_key(pair[1].get('title') or pair[0]['title']),
+            pair[0]['url'],
+        ))
+        await app.bot.send_message(chat_id, f'🎬 Películas publicadas ayer ({(datetime.now(TZ).date() - timedelta(days=1)).strftime("%d/%m/%Y")}): {len(cards)} fichas. Orden: calidad descendente y título alfabético.')
+        for item, info in cards:
+            await send_card(app, chat_id, item, info)
             await asyncio.sleep(0.12)
     except Exception as exc:
         LOG.exception('Error al consultar novedades')
