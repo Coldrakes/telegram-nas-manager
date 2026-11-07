@@ -57,6 +57,10 @@ def conn():
     c.execute('CREATE TABLE IF NOT EXISTS detail_cache (id TEXT PRIMARY KEY, torrent_url TEXT, updated_at TEXT)')
     c.execute('CREATE TABLE IF NOT EXISTS selections (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
     c.execute('CREATE TABLE IF NOT EXISTS downloaded (chat_id INTEGER, id TEXT, PRIMARY KEY(chat_id,id))')
+    c.execute('CREATE TABLE IF NOT EXISTS series_groups (id TEXT PRIMARY KEY, title TEXT, season INTEGER, quality TEXT, url TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS series_episodes (id TEXT PRIMARY KEY, group_id TEXT, episode TEXT, published TEXT, content_id TEXT, tabla TEXT)')
+    c.execute('CREATE TABLE IF NOT EXISTS series_selections (chat_id INTEGER, group_id TEXT, episode_id TEXT, PRIMARY KEY(chat_id,group_id,episode_id))')
+    c.execute('CREATE TABLE IF NOT EXISTS series_downloaded (chat_id INTEGER, episode_id TEXT, PRIMARY KEY(chat_id,episode_id))')
     return c
 
 
@@ -425,7 +429,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny(update)
     with conn() as c:
         c.execute('INSERT OR IGNORE INTO chats(chat_id) VALUES(?)', (update.effective_chat.id,))
-    await update.message.reply_text('Bot activado. Recibirás las fichas de películas cada día a las 07:00 (Europe/Madrid). Usa /novedades para consultarlas ahora.')
+    await update.message.reply_text('Bot activado. Películas diarias a las 07:00. Usa /novedades para películas y /series para series de ayer.')
 
 
 async def novedades(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,6 +442,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not permitted(update):
         return await deny(update)
     q = update.callback_query
+    if q.data == 'noop':
+        await q.answer()
+        return
+    if q.data.startswith(('tvopen:', 'tvpage:', 'tvtoggle:', 'tvall:', 'tvclear:', 'tvdownload:')):
+        return await series_callback(q)
     if q.data == 'done':
         await q.answer('Ya se añadió desde este chat.')
         return
@@ -478,7 +487,311 @@ async def post_init(app):
     with conn():
         pass
     app.job_queue.run_daily(daily, time=time(int(os.getenv('DAILY_HOUR','7')), int(os.getenv('DAILY_MINUTE','0')), tzinfo=TZ), name='daily-digest')
-    await app.bot.set_my_commands([('start','Activar resumen diario'),('novedades','Ver novedades ahora')])
+    await app.bot.set_my_commands([('start','Activar resumen diario'),('novedades','Ver películas de ayer'),('series','Ver series de ayer')])
+
+
+
+# --- Series: una ficha por URL (serie + temporada + calidad) ---
+def parse_latest_series():
+    soup = get_html(SOURCE)
+    yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+    groups = {}
+    for a in soup.select('a[href]'):
+        url = urljoin(SOURCE, a.get('href', ''))
+        p = urlparse(url)
+        if p.scheme != 'https' or p.hostname != DOMAIN or not re.fullmatch(r'/serie/\d+/\d+/[^/]+/?', p.path, re.I):
+            continue
+        title = a.get_text(' ', strip=True)
+        if not title or len(title) > 180:
+            continue
+        row = a.find_parent(['li', 'tr', 'p']) or a.parent
+        row_text = row.get_text(' ', strip=True) if row else ''
+        prefix = row_text.split(title, 1)[0] if title in row_text else ''
+        dates = re.findall(r'(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)', prefix)
+        if not dates or dates[-1] != yesterday:
+            continue
+        group_id = hashlib.sha256(('tv:' + url).encode()).hexdigest()[:16]
+        group = groups.setdefault(url, {'id': group_id, 'title': title.split(':', 1)[0].strip(), 'url': url, 'new_episodes': set()})
+        match = re.search(r'(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)', title, re.I)
+        if match:
+            group['new_episodes'].add(f'{int(match.group(1))}x{int(match.group(2)):02d}')
+    return list(groups.values())[:MAX_ITEMS]
+
+
+def series_metadata(soup, group):
+    heading = text_of(soup, ['h1', 'meta[property="og:title"]']) or group['title']
+    season_match = re.search(r'(\d+)\s*[ªºa]?\s*temporada', heading, re.I)
+    season = int(season_match.group(1)) if season_match else 0
+    series_name = re.split(r'\s*[-–]\s*\d+\s*[ªºa]?\s*temporada', heading, maxsplit=1, flags=re.I)[0].strip()
+    quality = labeled_field(soup, 'Formato') or re.search(r'\[([^]]+)\]', heading).group(1) if re.search(r'\[([^]]+)\]', heading) else labeled_field(soup, 'Formato')
+    description = labeled_field(soup, 'Descripción')
+    image = ''
+    for node in soup.select('meta[property="og:image"], img[alt], .poster img, .cover img'):
+        raw = node.get('content') or node.get('data-src') or node.get('src')
+        if not raw:
+            continue
+        url = urljoin(group['url'], raw)
+        if urlparse(url).scheme == 'https' and urlparse(url).hostname in (DOMAIN, 'images.weserv.nl'):
+            image = url
+            break
+    episodes = []
+    for tr in soup.select('tr'):
+        text = tr.get_text(' ', strip=True)
+        match = re.search(r'(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)', text, re.I)
+        if not match:
+            continue
+        button = tr.select_one('.protected-download[data-content-id][data-tabla]')
+        if button is None:
+            continue
+        content_id = button.get('data-content-id', '')
+        tabla = button.get('data-tabla', '')
+        if not content_id.isdigit() or tabla not in ('series', 'serie', 'episodios', 'series_hd', 'series_4k'):
+            # Keep the original table identifier if it is a safe simple string;
+            # the site may use a different name for series variants.
+            if not content_id.isdigit() or not re.fullmatch(r'[a-z_]{1,40}', tabla):
+                continue
+        ep = f'{int(match.group(1))}x{int(match.group(2)):02d}'
+        date_match = re.search(r'(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)', text)
+        date = date_match.group(1) if date_match else ''
+        episode_id = hashlib.sha256(f'{group["url"]}:{content_id}:{tabla}'.encode()).hexdigest()[:20]
+        episodes.append({'id': episode_id, 'episode': ep, 'date': date, 'content_id': content_id, 'tabla': tabla})
+    # Avoid repeated entries in the table and sort naturally.
+    episodes = list({e['id']: e for e in episodes}.values())
+    episodes.sort(key=lambda e: tuple(map(int, e['episode'].split('x'))))
+    return {'name': series_name, 'season': season, 'quality': quality or 'Sin especificar',
+            'description': description, 'image': image, 'episodes': episodes}
+
+
+def refresh_series():
+    groups = parse_latest_series()
+    prepared = []
+    for group in groups:
+        try:
+            meta = series_metadata(get_html(group['url']), group)
+            if not meta['episodes']:
+                LOG.warning('Sin botones de episodios detectados: %s', group['url'])
+                continue
+            prepared.append((group, meta))
+        except Exception:
+            LOG.exception('Error leyendo episodios de %s', group['url'])
+    prepared.sort(key=lambda pair: (quality_rank(pair[1]['quality']), alphabetical_key(pair[1]['name']), pair[1]['season']))
+    with conn() as c:
+        for group, meta in prepared:
+            c.execute('INSERT INTO series_groups(id,title,season,quality,url) VALUES(?,?,?,?,?) '
+                      'ON CONFLICT(id) DO UPDATE SET title=excluded.title,season=excluded.season,quality=excluded.quality,url=excluded.url',
+                      (group['id'], meta['name'], meta['season'], meta['quality'], group['url']))
+            for ep in meta['episodes']:
+                c.execute('INSERT INTO series_episodes(id,group_id,episode,published,content_id,tabla) VALUES(?,?,?,?,?,?) '
+                          'ON CONFLICT(id) DO UPDATE SET episode=excluded.episode,published=excluded.published,content_id=excluded.content_id,tabla=excluded.tabla',
+                          (ep['id'], group['id'], ep['episode'], ep['date'], ep['content_id'], ep['tabla']))
+    return prepared
+
+
+def series_caption(group, meta):
+    new = {ep['episode'] for ep in meta['episodes'] if ep['episode'] in group['new_episodes']}
+    lines = [f'📺 <b>{escape(meta["name"][:150])}</b>',
+             f'📚 <b>Temporada:</b> {meta["season"] or "Sin identificar"}',
+             f'🎞 <b>Formato:</b> {escape(meta["quality"][:80])}',
+             f'📦 <b>Capítulos:</b> {len(meta["episodes"])} · 🆕 {len(new)} publicados ayer']
+    if meta['description']:
+        lines.append('\n📖 ' + escape(meta['description'][:300]))
+    lines.append('\n<b>Episodios (fecha de publicación):</b>')
+    for ep in meta['episodes'][:18]:
+        lines.append(f'{"🆕 " if ep["episode"] in new else "• "}{ep["episode"]} — {ep["date"] or "Sin fecha"}')
+    if len(meta['episodes']) > 18:
+        lines.append(f'… y {len(meta["episodes"])-18} más en el selector')
+    lines.append('\n<a href="' + escape(group['url'], quote=True) + '">Ver ficha en DonTorrent</a>')
+    return '\n'.join(lines)[:1000]
+
+
+def series_keyboard(group_id):
+    return InlineKeyboardMarkup([[InlineKeyboardButton('📥 Seleccionar capítulos', callback_data='tvopen:' + group_id)]])
+
+
+async def send_series_card(app, chat_id, group, meta):
+    body = series_caption(group, meta)
+    if meta['image']:
+        try:
+            import io
+            def get_image():
+                r = SESSION.get(meta['image'], timeout=20, allow_redirects=False)
+                r.raise_for_status()
+                if not r.headers.get('content-type', '').lower().startswith('image/') or len(r.content) > 9_000_000:
+                    raise ValueError('Imagen inválida')
+                return r.content
+            content = await asyncio.to_thread(get_image)
+            await app.bot.send_photo(chat_id, photo=io.BytesIO(content), caption=body,
+                                     parse_mode='HTML', reply_markup=series_keyboard(group['id']))
+            return
+        except Exception:
+            LOG.warning('No se pudo enviar portada de serie %s', group['url'], exc_info=True)
+    await app.bot.send_message(chat_id, body, parse_mode='HTML',
+                               reply_markup=series_keyboard(group['id']), disable_web_page_preview=True)
+
+
+async def series_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not permitted(update):
+        return await deny(update)
+    chat_id = update.effective_chat.id
+    await update.message.reply_text('📺 Buscando series publicadas ayer y leyendo sus capítulos…')
+    prepared = await asyncio.to_thread(refresh_series)
+    if not prepared:
+        await update.message.reply_text('No se encontraron fichas de series con episodios descargables publicados ayer. Revisa los logs del contenedor.')
+        return
+    date = (datetime.now(TZ).date() - timedelta(days=1)).strftime('%d/%m/%Y')
+    await update.message.reply_text(f'📺 Series con novedades del {date}: {len(prepared)} fichas (serie + temporada + calidad).')
+    for group, meta in prepared:
+        await send_series_card(context.application, chat_id, group, meta)
+        await asyncio.sleep(0.12)
+
+
+def episode_picker(chat_id, group_id, page=0):
+    with conn() as c:
+        c.row_factory = sqlite3.Row
+        group = c.execute('SELECT * FROM series_groups WHERE id=?', (group_id,)).fetchone()
+        if not group:
+            return None
+        episodes = c.execute('SELECT * FROM series_episodes WHERE group_id=? ORDER BY episode', (group_id,)).fetchall()
+        selected = {r[0] for r in c.execute('SELECT episode_id FROM series_selections WHERE chat_id=? AND group_id=?', (chat_id, group_id))}
+        done = {r[0] for r in c.execute('SELECT episode_id FROM series_downloaded WHERE chat_id=?', (chat_id,))}
+    page = max(0, min(page, max(0, (len(episodes)-1)//8)))
+    rows = []
+    for ep in episodes[page*8:(page+1)*8]:
+        prefix = '✅' if ep['id'] in done else '☑️' if ep['id'] in selected else '☐'
+        label = f'{prefix} {ep["episode"]} · {ep["published"] or "Sin fecha"}'
+        rows.append([InlineKeyboardButton(label, callback_data=f'tvtoggle:{group_id}:{ep["id"]}:{page}')])
+    rows.append([InlineKeyboardButton('◀', callback_data=f'tvpage:{group_id}:{max(0,page-1)}'),
+                 InlineKeyboardButton(f'{page+1}/{max(1,(len(episodes)+7)//8)}', callback_data='noop'),
+                 InlineKeyboardButton('▶', callback_data=f'tvpage:{group_id}:{min((len(episodes)-1)//8,page+1)}')])
+    rows.append([InlineKeyboardButton('☑️ Seleccionar todos los pendientes', callback_data=f'tvall:{group_id}')])
+    rows.append([InlineKeyboardButton(f'📥 Descargar seleccionados ({len(selected)})', callback_data=f'tvdownload:{group_id}')])
+    rows.append([InlineKeyboardButton('🗑 Limpiar selección', callback_data=f'tvclear:{group_id}')])
+    title = f'📺 {group["title"]} · T{group["season"]} · {group["quality"]}\nSelecciona capítulos (los marcados ✅ ya fueron añadidos):'
+    return title, InlineKeyboardMarkup(rows)
+
+
+def find_episode_torrent(ep, group_url):
+    # Reuse the same PoW flow as films, with the unique button ID for this episode.
+    with conn() as c:
+        cached = c.execute('SELECT torrent_url FROM detail_cache WHERE id=?', (ep['id'],)).fetchone()
+    if cached and cached[0]:
+        return safe_url(cached[0])
+    generated = pow_request({'action': 'generate', 'content_id': int(ep['content_id']), 'tabla': ep['tabla']})
+    nonce = pow_nonce(generated.get('challenge'))
+    validated = pow_request({'action': 'validate', 'challenge': generated['challenge'], 'nonce': nonce})
+    url = validated.get('download_url')
+    if not isinstance(url, str) or not url:
+        raise ValueError('DonTorrent no devolvió enlace para el episodio')
+    url = safe_url(urljoin(group_url, url))
+    if not urlparse(url).path.lower().endswith('.torrent'):
+        raise ValueError('La descarga del episodio no es un archivo .torrent')
+    cache_torrent(ep['id'], url)
+    return url
+
+
+def submit_episode(ep, group_url):
+    url = find_episode_torrent(ep, group_url)
+    content = torrent_bytes(url)
+    qb = qbittorrentapi.Client(host=os.environ['QBIT_URL'], username=os.environ['QBIT_USER'],
+                               password=os.environ['QBIT_PASSWORD'], REQUESTS_ARGS={'timeout': 20})
+    qb.auth_log_in()
+    if 'tv' not in qb.torrents_categories():
+        raise ValueError('No existe la categoría tv en qBittorrent')
+    result = qb.torrents_add(torrent_files=content, category='tv')
+    if hasattr(result, 'success_count'):
+        if result.success_count < 1 or result.failure_count > 0:
+            raise RuntimeError(f'qBittorrent no confirmó el episodio: {result}')
+    elif str(result).strip().lower() not in ('ok.', 'ok', 'true'):
+        raise RuntimeError(f'qBittorrent respondió: {result}')
+
+
+SERIES_BUSY = set()
+
+async def series_callback(q):
+    data = q.data
+    chat_id = q.message.chat_id
+    if data.startswith('tvopen:') or data.startswith('tvpage:'):
+        parts = data.split(':')
+        group_id = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        picker = episode_picker(chat_id, group_id, page)
+        if not picker:
+            await q.answer('Ficha no encontrada; ejecuta /series', show_alert=True)
+            return
+        await q.answer()
+        if data.startswith('tvopen:'):
+            await q.message.reply_text(picker[0], reply_markup=picker[1])
+        else:
+            await q.edit_message_text(picker[0], reply_markup=picker[1])
+        return
+    parts = data.split(':')
+    action, group_id = parts[:2]
+    if action == 'tvtoggle':
+        episode_id, page = parts[2], int(parts[3])
+        with conn() as c:
+            exists = c.execute('SELECT 1 FROM series_episodes WHERE id=? AND group_id=?', (episode_id, group_id)).fetchone()
+            if not exists:
+                await q.answer('Episodio no encontrado', show_alert=True)
+                return
+            already = c.execute('SELECT 1 FROM series_downloaded WHERE chat_id=? AND episode_id=?', (chat_id, episode_id)).fetchone()
+            if already:
+                await q.answer('Este capítulo ya se añadió', show_alert=True)
+                return
+            chosen = c.execute('SELECT 1 FROM series_selections WHERE chat_id=? AND group_id=? AND episode_id=?', (chat_id, group_id, episode_id)).fetchone()
+            if chosen:
+                c.execute('DELETE FROM series_selections WHERE chat_id=? AND group_id=? AND episode_id=?', (chat_id, group_id, episode_id))
+            else:
+                c.execute('INSERT OR IGNORE INTO series_selections VALUES(?,?,?)', (chat_id, group_id, episode_id))
+    elif action in ('tvall', 'tvclear'):
+        with conn() as c:
+            c.execute('DELETE FROM series_selections WHERE chat_id=? AND group_id=?', (chat_id, group_id))
+            if action == 'tvall':
+                c.execute('INSERT OR IGNORE INTO series_selections(chat_id,group_id,episode_id) '
+                          'SELECT ?,group_id,id FROM series_episodes WHERE group_id=? AND id NOT IN '
+                          '(SELECT episode_id FROM series_downloaded WHERE chat_id=?)', (chat_id, group_id, chat_id))
+        page = 0
+    elif action == 'tvdownload':
+        key = (chat_id, group_id)
+        if key in SERIES_BUSY:
+            await q.answer('Ya hay una descarga en curso para esta ficha', show_alert=True)
+            return
+        with conn() as c:
+            c.row_factory = sqlite3.Row
+            group = c.execute('SELECT * FROM series_groups WHERE id=?', (group_id,)).fetchone()
+            selected = c.execute('SELECT e.* FROM series_episodes e JOIN series_selections s ON e.id=s.episode_id '
+                                 'WHERE s.chat_id=? AND s.group_id=? ORDER BY e.episode', (chat_id, group_id)).fetchall()
+        if not group or not selected:
+            await q.answer('Selecciona primero algún episodio', show_alert=True)
+            return
+        SERIES_BUSY.add(key)
+        await q.answer('Añadiendo capítulos a qBittorrent…')
+        await q.message.reply_text(f'⏳ Añadiendo {len(selected)} capítulo(s) a qBittorrent…')
+        results = []
+        try:
+            for ep in selected:
+                try:
+                    await asyncio.to_thread(submit_episode, dict(ep), group['url'])
+                    with conn() as c:
+                        c.execute('INSERT OR IGNORE INTO series_downloaded(chat_id,episode_id) VALUES(?,?)', (chat_id, ep['id']))
+                        c.execute('DELETE FROM series_selections WHERE chat_id=? AND group_id=? AND episode_id=?', (chat_id, group_id, ep['id']))
+                    results.append(f'✅ {ep["episode"]} — Añadido')
+                except Exception as exc:
+                    LOG.exception('Error descargando serie %s episodio %s', group['title'], ep['episode'])
+                    results.append(f'❌ {ep["episode"]} — {str(exc)[:130]}')
+            await q.message.reply_text(f'📺 {group["title"]} · T{group["season"]} · {group["quality"]}\n' + '\n'.join(results) + '\n📁 Categoría: tv')
+            picker = episode_picker(chat_id, group_id)
+            if picker:
+                await q.edit_message_text(picker[0], reply_markup=picker[1])
+        finally:
+            SERIES_BUSY.discard(key)
+        return
+    else:
+        await q.answer('Acción no reconocida', show_alert=True)
+        return
+    picker = episode_picker(chat_id, group_id, page if action == 'tvtoggle' else 0)
+    await q.answer()
+    if picker:
+        await q.edit_message_text(picker[0], reply_markup=picker[1])
 
 
 def main():
@@ -486,6 +799,7 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('novedades', novedades))
+    app.add_handler(CommandHandler('series', series_command))
     app.add_handler(CallbackQueryHandler(callback))
     app.run_polling(drop_pending_updates=True)
 

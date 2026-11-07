@@ -1,30 +1,33 @@
-# Telegram NAS Manager — películas de ayer
+# Telegram NAS Manager — películas + series (prueba)
 
-Bot para NAS UGREEN. A las 07:00 (Europe/Madrid) o con `/novedades`, muestra fichas individuales de películas publicadas **ayer** en `https://dontorrent.tips/ultimos`, con portada, géneros, formato, sinopsis y botón Descargar.
+Versión basada en la última compilación funcional del bot de películas.
 
-Orden por calidad: 4K, BDremux-1080p, BluRay-1080p, MicroHD-1080p, HDTV-1080p, HDRip, HDTV, DVDRip; dentro de cada calidad, alfabéticamente.
+## Comandos
 
-Al pulsar Descargar, reutiliza el enlace `.torrent` si se encontró durante la lectura de la ficha; si no, consulta la ficha con reintentos limitados. Valida el torrent y lo envía a qBittorrent con categoría `movies`. No integra Radarr/Sonarr. Si la ficha no expone un enlace `.torrent` inequívoco, informa del error en vez de inventarlo.
+- `/novedades`: películas publicadas ayer, una ficha por película, orden por calidad y título.
+- `/series`: series con episodios publicados ayer, **una ficha por serie + temporada + calidad**. La ficha se obtiene de `/ultimos`, pero los episodios y sus fechas se extraen de la página de la serie, incluidos capítulos antiguos.
+- `/start`: registra el chat para el resumen diario de películas.
+
+## Series
+
+1. El bot lee `/ultimos` y localiza las páginas `/serie/<id>/<id>/<slug>` con novedades de ayer.
+2. Abre cada página una sola vez y extrae la temporada, formato, descripción, portada y filas de episodios.
+3. Cada fila debe contener un botón `.protected-download` con `data-content-id` y `data-tabla`, además de número y fecha del capítulo.
+4. Publica una ficha por página de serie/temporada/calidad, con botón **Seleccionar capítulos**.
+5. El selector permite marcar episodios individualmente, marcar todos los pendientes, limpiar selección y descargar los marcados.
+6. Cada episodio se valida por separado mediante el mecanismo PoW publicado por el sitio, y se añade a qBittorrent con categoría `tv`.
+7. Los episodios añadidos se marcan con ✅ para ese chat; las selecciones y estados persisten en SQLite en `/app/data/state.sqlite3`.
+
+La selección de episodios no descarga nada hasta pulsar **Descargar seleccionados**. Los errores individuales se notifican sin detener el resto. Si DonTorrent exige CAPTCHA o devuelve límite de uso, no se intenta eludirlo.
 
 ## Instalación
 
-Configura `BOT_TOKEN`, `ALLOWED_USERS`, `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD` (ver `.env.example`). Mantén `/app/data` persistente para SQLite. Construye la imagen y súbela a `hclementearrieta/telegram-nas-manager:latest`, luego recrea el contenedor en Portainer. No se necesita publicar puertos.
+1. Configura `.env` o variables de entorno con `BOT_TOKEN`, `ALLOWED_USERS`, `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD` y `TZ=Europe/Madrid`.
+2. Construye la imagen con `docker build -t hclementearrieta/telegram-nas-manager:latest .` y publícala en tu registro si Portainer descarga la imagen desde allí.
+3. Conserva el volumen `/volume1/data/telegram-nas-manager:/app/data` para no perder SQLite.
+4. Recréalo en Portainer con la nueva imagen.
+5. Prueba `/series`, abre un selector y descarga **un solo episodio de prueba** antes de seleccionar varios.
 
-**Seguridad:** si un token de Telegram aparece en logs compartidos, revócalo en BotFather y actualiza el contenedor. La versión actual silencia los logs INFO de `httpx` que suelen incluir el token en la URL.
+**Importante:** el código ha superado comprobación de sintaxis y pruebas de análisis HTML con una ficha de ejemplo, pero no se ha probado contra el HTML dinámico real de DonTorrent ni contra tu NAS. Si las filas reales utilizan una estructura diferente a `<tr>`, el extractor de episodios necesitará un ajuste. No se ha realizado una compilación de imagen Docker ni una prueba extremo a extremo.
 
-## Limitaciones
-
-No se ha probado contra tu instancia real de Telegram/qBittorrent ni contra el HTML en vivo. La caché del enlace funciona cuando hay un único enlace `.torrent` explícito en el HTML de la ficha. Las páginas que generen enlaces exclusivamente con JavaScript pueden requerir adaptar el extractor. Las fichas antiguas ya enviadas no cambian hasta ejecutar de nuevo `/novedades`.
-
-## Descarga protegida (PoW)
-
-El bot detecta `.protected-download` en la ficha y utiliza `data-content-id` y
-`data-tabla` para solicitar el desafío al endpoint publicado por DonTorrent.
-Calcula el nonce SHA-256 de dificultad 3 y envía la validación. Si recibe una
-`download_url` válida del mismo dominio, descarga el `.torrent` y lo envía a
-qBittorrent con la categoría `movies`.
-
-**Límites:** ante CAPTCHA, HTTP 429 o límite de descargas, el bot se detiene y
-muestra un error; no resuelve CAPTCHAs ni intenta evitar restricciones.
-No se ha probado la descarga completa contra el servicio externo ni contra el NAS.
-Revoca cualquier token de Telegram que haya aparecido en logs compartidos.
+**Seguridad:** revoca el token anterior si se expuso en logs. El bot reduce el registro de URLs de Telegram mediante los niveles de log de httpx/httpcore.
