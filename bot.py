@@ -257,22 +257,79 @@ def cache_torrent(item_id, url):
         c.execute('UPDATE items SET torrent_url=? WHERE id=?', (safe_url(url), item_id))
 
 
+def pow_nonce(challenge, difficulty=3, max_attempts=2_000_000):
+    """Implementa el desafío SHA-256 publicado por el propio sitio."""
+    if not isinstance(challenge, str) or not challenge or len(challenge) > 2048:
+        raise ValueError('Challenge de descarga no válido')
+    prefix = '0' * difficulty
+    for nonce in range(max_attempts):
+        if hashlib.sha256(f'{challenge}{nonce}'.encode('utf-8')).hexdigest().startswith(prefix):
+            return nonce
+    raise RuntimeError('No se pudo resolver el desafío en el límite previsto')
+
+
+def pow_request(payload):
+    endpoint = f'https://{DOMAIN}/api_validate_pow.php'
+    # No seguir redirecciones ni reintentar automáticamente POST: pueden consumir un desafío.
+    try:
+        response = SESSION.post(endpoint, json=payload, timeout=(10, 35), allow_redirects=False)
+    except requests.Timeout as exc:
+        raise RuntimeError('DonTorrent no respondió a la validación a tiempo') from exc
+    if response.status_code == 429:
+        raise RuntimeError('Límite de descargas de DonTorrent alcanzado; inténtalo más tarde')
+    if response.status_code != 200:
+        raise RuntimeError(f'Validación de DonTorrent: HTTP {response.status_code}')
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError('DonTorrent no devolvió una respuesta JSON válida') from exc
+    if not isinstance(result, dict):
+        raise RuntimeError('Respuesta de validación inesperada')
+    if result.get('status') == 'limit_exceeded':
+        raise RuntimeError('Límite de descargas de DonTorrent alcanzado')
+    if result.get('status') == 'captcha_required':
+        raise RuntimeError('DonTorrent solicita CAPTCHA: abre la ficha en el navegador para completar la verificación')
+    if not result.get('success'):
+        raise RuntimeError('DonTorrent rechazó la validación: ' + str(result.get('error', 'sin detalles'))[:120])
+    return result
+
+
 def find_torrent(item):
-    # Cached link avoids another slow HTML request when the user taps Download.
     with conn() as c:
         cached = c.execute('SELECT torrent_url FROM detail_cache WHERE id=?', (item['id'],)).fetchone()
     if cached and cached[0]:
         return safe_url(cached[0])
     if item.get('torrent_url'):
         return safe_url(item['torrent_url'])
+
     soup = get_html(item['url'])
     candidates = extract_torrent_links(soup, item['url'])
-    if not candidates:
-        raise ValueError('No hay enlace .torrent directo en la ficha; no se puede identificar la descarga con seguridad')
-    if len(candidates) != 1:
-        raise ValueError(f'La ficha contiene {len(candidates)} torrents; selección ambigua')
-    cache_torrent(item['id'], candidates[0])
-    return candidates[0]
+    if len(candidates) == 1:
+        cache_torrent(item['id'], candidates[0])
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ValueError('Hay varios enlaces .torrent en la ficha: descarga ambigua')
+
+    button = soup.select_one('.protected-download[data-content-id][data-tabla]')
+    if button is None:
+        raise ValueError('No se encontró el botón de descarga protegido en la ficha')
+    content_id = button.get('data-content-id', '')
+    tabla = button.get('data-tabla', '')
+    if not content_id.isdigit() or tabla != 'peliculas':
+        raise ValueError('Identificador o tipo de contenido no válido')
+
+    generated = pow_request({'action': 'generate', 'content_id': int(content_id), 'tabla': tabla})
+    challenge = generated.get('challenge')
+    nonce = pow_nonce(challenge)
+    validated = pow_request({'action': 'validate', 'challenge': challenge, 'nonce': nonce})
+    url = validated.get('download_url')
+    if not isinstance(url, str) or not url:
+        raise ValueError('La validación no devolvió un enlace de descarga')
+    url = safe_url(urljoin(item['url'], url))
+    if not urlparse(url).path.lower().endswith('.torrent'):
+        raise ValueError('La URL de descarga no corresponde a un archivo .torrent')
+    cache_torrent(item['id'], url)
+    return url
 
 
 def torrent_bytes(url):
